@@ -1,0 +1,20 @@
+name = "Tenferro"
+uuid = "d33ea9cf-7ee9-48af-8625-0ce6eefcc2e6"
+version = "0.1.0"
+authors = ["SatoshiTerasaki <terasakisatoshi.math@gmail.com>"]
+
+[workspace]
+projects = ["test", "docs"]
+
+[deps]
+ADTypes = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
+ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+DifferentiationInterface = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
+RustCall = "7ac5b1a4-9e37-4f0e-9aa3-3305a66bfb1c"
+
+[compat]
+julia = "1.13"
+ADTypes = "1.24.0"
+ChainRulesCore = "1.26.8"
+DifferentiationInterface = "0.7.21"
+RustCall = "0.9.0"
