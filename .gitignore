@@ -2,5 +2,3 @@
 /docs/node_modules/
 /docs/package-lock.json
 /deps/build.log
-
-/deps/rust/target/
