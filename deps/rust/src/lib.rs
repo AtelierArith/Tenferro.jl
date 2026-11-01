@@ -189,6 +189,22 @@ impl EagerGraph {
     }
 
     #[julia]
+    pub fn jvp_node(&mut self, output: usize, input: usize, seed: usize) -> Result<i64, String> {
+        let result = (|| -> FfiResult<Option<EagerTensor>> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let y = self.nodes.get(output).ok_or("invalid output")?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let seed = self.nodes.get(seed).ok_or("invalid tangent")?;
+            Ok(ctx.jvp_optional(&mut tenferro_cpu::CpuEngine::serial(), y, x, seed)?)
+        })();
+        match result {
+            Ok(Some(value)) => Ok(self.push(value)),
+            Ok(None) => Ok(-2),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    #[julia]
     pub fn binary(&mut self, lhs: usize, rhs: usize, op: i32) -> Result<i64, String> {
         let result = (|| -> Result<EagerTensor, Box<dyn std::error::Error>> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;

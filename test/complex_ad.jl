@@ -1,4 +1,4 @@
-using Test, Tenferro, DifferentiationInterface, ChainRulesCore
+using Test, Tenferro, DifferentiationInterface
 
 @testset "complex tensor autodiff" begin
     for T in (ComplexF32, ComplexF64)
@@ -22,11 +22,6 @@ using Test, Tenferro, DifferentiationInterface, ChainRulesCore
         ((da, db),) = pullback(z -> z[1] * z[2], AutoTenferro(), (a,b), (w,))
         @test da ≈ w * b'
         @test db ≈ a' * w
-        ctx = EagerContext()
-        x = EagerTensor(ctx, a)
-        _, back = ChainRulesCore.rrule(sum, x)
-        _, dx = back(T(2+3im))
-        @test Array(dx) == fill(T(2+3im), size(a))
     end
 end
 

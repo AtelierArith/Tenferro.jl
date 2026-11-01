@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "fc196c6b690ec3c5a9f22ede0626bc2275ffaab0"
+project_hash = "1636ecc332e5fbd5f36a23de128122b0006d4f31"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -699,10 +699,14 @@ uuid = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
 version = "1.10.0"
 
 [[deps.Tenferro]]
-deps = ["ADTypes", "ChainRulesCore", "DifferentiationInterface", "RustCall"]
+deps = ["ADTypes", "DifferentiationInterface", "RustCall"]
 path = "."
 uuid = "d33ea9cf-7ee9-48af-8625-0ce6eefcc2e6"
 version = "0.1.0"
+weakdeps = ["ChainRulesCore"]
+
+    [deps.Tenferro.extensions]
+    TenferroChainRulesCoreExt = "ChainRulesCore"
 
 [[deps.Test]]
 deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]

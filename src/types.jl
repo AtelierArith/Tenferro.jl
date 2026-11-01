@@ -4,7 +4,8 @@
 DifferentiationInterface backend for first-order gradients of scalar-valued
 functions built from supported tenferro operations on CPU arrays of Float32, Float64, ComplexF32, or ComplexF64.
 Supports addition, subtraction, matrix multiplication, and `sum`; gradients of
-scalar outputs and array-output pullbacks for tuples of array inputs.
+scalar outputs, pullbacks and pushforwards for arrays or tuples of arrays.
+Differentiation uses tenferro-rs JVPs and VJPs, independent of ChainRules rules.
 """
 struct AutoTenferro <: AbstractADType end
 

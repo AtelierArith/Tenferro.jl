@@ -47,17 +47,24 @@ end
 
 
 const rule_calls = Ref(0)
-probe(x::EagerTensor) = Tenferro._apply_rule(probe, (x,), () -> x + x)
+probe(x::EagerTensor) = x + x
 function ChainRulesCore.rrule(::typeof(probe), x::EagerTensor)
     rule_calls[] += 1
-    y = x + x
-    back(seed) = (NoTangent(), seed + seed)
-    return y, back
+    return x + x, seed -> (NoTangent(), seed + seed)
 end
 
-@testset "AutoTenferro invokes registered rules" begin
-    rule_calls[] = 0
+@testset "Rust AD and pushforwards" begin
     x = [1.0 2.0; 3.0 4.0]
-    @test DifferentiationInterface.gradient(a -> sum(probe(a)), AutoTenferro(), x) ≈ fill(2.0, 2, 2)
-    @test rule_calls[] == 1
+    dx = [0.5 1.0; -1.0 2.0]
+    @test gradient(a -> sum(probe(a)), AutoTenferro(), x) ≈ fill(2.0, 2, 2)
+    @test rule_calls[] == 0
+    (dy,) = pushforward(a -> a * a, AutoTenferro(), x, (dx,))
+    @test dy ≈ dx * x + x * dx
+    @test only(pushforward(a -> sum(a * a), AutoTenferro(), x, (dx,))) ≈ sum(dx * x + x * dx)
+    @test only(pullback(a -> sum(a * a), AutoTenferro(), x, (1.0,))) ≈ ones(2, 2) * x' + x' * ones(2, 2)
+    (dy2,) = pushforward(z -> z[1] * z[2], AutoTenferro(), (x, x), ((dx, dx),))
+    @test dy2 ≈ dx * x + x * dx
+    (back,) = pullback(a -> a * a, AutoTenferro(), x, (dx,))
+    @test back ≈ dx * x' + x' * dx
+    @test_throws Exception gradient(a -> sum(sin(a)), AutoTenferro(), x)
 end

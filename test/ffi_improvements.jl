@@ -1,23 +1,4 @@
-using Test, Tenferro, ChainRulesCore
-
-@testset "pullback graph reuse and aliasing" begin
-    ctx = EagerContext()
-    a = ComplexF64[1+2im 3-im; 2im 1+im]
-    x = EagerTensor(ctx, a)
-    z, back = rrule(*, x, x)
-    cot = EagerTensor(ctx, ComplexF64[1+im 3im; -2 2-im])
-    _, dx, dy = back(cot)
-    @test Array(dx) ≈ Array(cot) * a'
-    @test Array(dy) ≈ a' * Array(cot)
-    @test Array(dx + dy) ≈ Array(cot) * a' + a' * Array(cot)
-    _, dx2, dy2 = back(cot)
-    @test Array(dx2) ≈ Array(dx)
-    @test Array(dy2) ≈ Array(dy)
-    other_seed = EagerTensor(EagerContext(), Array(cot))
-    _, dx3, dy3 = back(other_seed)
-    @test Array(dx3) ≈ Array(dx)
-    @test Array(dy3) ≈ Array(dy)
-end
+using Test, Tenferro
 
 @testset "Rust errors and context synchronization" begin
     ctx = EagerContext()

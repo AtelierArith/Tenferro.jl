@@ -8,32 +8,26 @@ end
 
 for (op, code) in ((:+, 0), (:-, 1))
     @eval function Base.$op(a::EagerTensor{T,N}, b::EagerTensor{T,N}) where {T,N}
-        return _apply_rule($op, (a, b), () -> begin
-            a.graph === b.graph || throw(ArgumentError("tensors belong to different runtimes"))
-            a.dims == b.dims || throw(DimensionMismatch("tensor shapes do not match"))
-            id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.binary, UInt(a.id), UInt(b.id), Int32($code)))
-            id >= 0 || error("tenferro-rs operation failed")
-            EagerTensor{T,N,typeof(a.graph)}(a.graph, id, a.dims)
-        end)
+        a.graph === b.graph || throw(ArgumentError("tensors belong to different runtimes"))
+        a.dims == b.dims || throw(DimensionMismatch("tensor shapes do not match"))
+        id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.binary, UInt(a.id), UInt(b.id), Int32($code)))
+        id >= 0 || error("tenferro-rs operation failed")
+        EagerTensor{T,N,typeof(a.graph)}(a.graph, id, a.dims)
     end
 end
 
 function Base.:*(a::EagerTensor{T,2}, b::EagerTensor{T,2}) where {T}
-    return _apply_rule(*, (a, b), () -> begin
-        a.graph === b.graph || throw(ArgumentError("tensors belong to different runtimes"))
-        a.dims[2] == b.dims[1] || throw(DimensionMismatch("matrix dimensions do not match"))
-        id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.matmul, UInt(a.id), UInt(b.id)))
-        id >= 0 || error("tenferro-rs matrix multiplication failed")
-        EagerTensor{T,2,typeof(a.graph)}(a.graph, id, (a.dims[1], b.dims[2]))
-    end)
+    a.graph === b.graph || throw(ArgumentError("tensors belong to different runtimes"))
+    a.dims[2] == b.dims[1] || throw(DimensionMismatch("matrix dimensions do not match"))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.matmul, UInt(a.id), UInt(b.id)))
+    id >= 0 || error("tenferro-rs matrix multiplication failed")
+    EagerTensor{T,2,typeof(a.graph)}(a.graph, id, (a.dims[1], b.dims[2]))
 end
 
 function Base.sum(a::EagerTensor{T}) where {T}
-    return _apply_rule(sum, (a,), () -> begin
-        id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.sum, UInt(a.id)))
-        id >= 0 || error("tenferro-rs reduction failed")
-        EagerScalar{T,typeof(a.graph)}(a.graph, id)
-    end)
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.sum, UInt(a.id)))
+    id >= 0 || error("tenferro-rs reduction failed")
+    EagerScalar{T,typeof(a.graph)}(a.graph, id)
 end
 
 function Base.Array(x::TracedTensor{T}) where {T}

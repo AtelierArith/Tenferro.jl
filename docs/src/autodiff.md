@@ -1,6 +1,6 @@
 # Automatic differentiation
 
-`AutoTenferro()` is a DifferentiationInterface backend. It traces supported eager operations and applies their ChainRulesCore `rrule` pullbacks in reverse; the binary-operation rules call tenferro-rs VJPs. Julia 1.13 or later is required.
+`AutoTenferro()` is a DifferentiationInterface backend. It records supported operations in tenferro-rs and uses its JVP and VJP transformations directly. It does not consult ChainRules `rrule` or `frule` methods. Julia 1.13 or later is required.
 
 ## Scalar-output gradients
 
@@ -39,9 +39,28 @@ julia> gx ≈ seed * y' && gy ≈ x' * seed
 true
 ```
 
+## Pushforwards
+
+```jldoctest
+julia> using Tenferro, DifferentiationInterface
+
+julia> x = [1.0 2.0; 3.0 4.0]; dx = ones(2, 2);
+
+julia> (dy,) = pushforward(a -> a * a, AutoTenferro(), x, (dx,));
+
+julia> dy ≈ dx * x + x * dx
+true
+```
+
+For tuple inputs, each tangent has the same tuple structure as the input. Multiple tangent directions can be passed in the outer tuple.
+
 ## Current scope
 
-The backend accepts CPU arrays with `Float32`, `Float64`, `ComplexF32` or `ComplexF64` elements. Gradient requires a scalar result from a supported reduction; array-output pullbacks accept a tuple of array inputs and seeds with the same shape and element type as the output. Addition, subtraction and `sum` support arbitrary ranks, while `*` currently requires matrices. Eager `sum` currently fails on empty arrays. Only operations integrated with the eager tape are recorded: defining an `rrule` for an arbitrary Julia function does not automatically make it traceable. Broadcasting, prepared calls, forward mode and higher-order derivatives are not yet supported.
+The backend accepts CPU arrays with `Float32`, `Float64`, `ComplexF32` or `ComplexF64` elements. Gradient requires a scalar result from a supported reduction. Pullbacks accept scalar or array output seeds, and pushforwards accept tangents matching the input structure, shapes and element types. Addition, subtraction and `sum` support arbitrary ranks, while `*` currently requires matrices. Eager `sum` currently fails on empty arrays. Functions must consist of supported Tenferro operations; defining an `rrule` for an arbitrary Julia function does not make it traceable. Unsupported operations raise errors. Broadcasting, prepared calls and higher-order derivatives are not yet supported.
+
+## Optional ChainRules rules
+
+Loading `ChainRulesCore` together with Tenferro activates the `TenferroChainRulesCoreExt` package extension. It provides first-order `rrule`s for `+`, `-`, matrix `*`, and `sum` on `EagerTensor`; pullbacks return `EagerTensor` cotangents. These rules are separate from `AutoTenferro` and do not guarantee interoperability with a particular AD engine.
 
 ## Traced graphs
 
@@ -61,7 +80,7 @@ julia> gradient(x -> sum(x * x), AutoTenferroTraced(), [1.0 2.0; 3.0 4.0]) ≈ [
 true
 ```
 
-`AutoTenferroTraced()` uses tenferro-rs graph transformations, independently of the eager ChainRules tape. It supports scalar gradients for an array or a tuple of arrays; traced pullbacks, JVPs, prepared execution and symbolic inputs are not yet exposed. Supported data is CPU arrays of `Float32`, `Float64`, `ComplexF32` or `ComplexF64`; operations are `+`, `-`, matrix `*`, and `sum`. Each `Array` conversion compiles and executes the graph anew.
+`AutoTenferroTraced()` uses tenferro-rs graph transformations, through a separate traced context. It supports scalar gradients for an array or a tuple of arrays; traced pullbacks, JVPs, prepared execution and symbolic inputs are not yet exposed. Supported data is CPU arrays of `Float32`, `Float64`, `ComplexF32` or `ComplexF64`; operations are `+`, `-`, matrix `*`, and `sum`. Each `Array` conversion compiles and executes the graph anew.
 
 ## Complex differentiation convention
 

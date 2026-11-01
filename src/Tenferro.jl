@@ -1,7 +1,6 @@
 module Tenferro
 
 using RustCall
-using ChainRulesCore
 using ADTypes: AbstractADType
 import DifferentiationInterface
 
@@ -13,6 +12,5 @@ include("ffi.jl")
 include("types.jl")
 include("operators.jl")
 include("autodiff.jl")
-include("TenferroChainRules.jl")
 
 end

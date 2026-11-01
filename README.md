@@ -1,17 +1,66 @@
 # Tenferro.jl
 
-An experimental Julia interface to the local `extern/tenferro-rs` checkout,
-using RustCall.jl and DifferentiationInterface.jl.
+Tenferro.jl is an experimental Julia interface to [tenferro-rs](https://github.com/tensor4all/tenferro-rs). It uses RustCall.jl to run tensor operations and exposes tenferro-rs automatic differentiation through DifferentiationInterface.jl.
 
-Julia 1.13 and a Rust toolchain (Rust 1.96 or newer) are required. Clone this repository with `git clone --recurse-submodules https://github.com/AtelierArith/Tenferro.jl.git`, or run `git submodule update --init --recursive` after cloning. The pinned `extern/tenferro-rs` submodule provides the Rust dependencies. Run `julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.build("Tenferro")'`,
-and run tests with `julia --project -e 'using Pkg; Pkg.test()'`. The first load
-compiles the Rust dependencies if the build cache is missing. The Rust crate
-lives in `deps/rust`; `deps/build.jl` can warm RustCall’s build cache. FiniteDiff is used in tests for numerical comparisons.
+## Setup
 
-`EagerTensor` provides a Julia handle for a tenferro-rs eager tensor. Tensors
-used together must share a context. Currently CPU tensors of the seven built-in tenferro-rs element types,
-`+`, `-`, matrix `*`, and `sum` are supported. Binary operations have
-ChainRulesCore reverse rules backed by tenferro-rs VJPs.
+Julia 1.13 or later and a Rust toolchain are required. Initialize the tenferro-rs submodule, then instantiate and build the package:
+
+```sh
+git submodule update --init --recursive
+julia --project -e 'using Pkg; Pkg.instantiate(; workspace=true); Pkg.build("Tenferro")'
+```
+
+The first load compiles the Rust dependencies if the build cache is missing. The Rust crate is in `deps/rust`; `deps/build.jl` can warm RustCall's build cache.
+
+## Automatic differentiation
+
+`AutoTenferro()` differentiates functions composed of supported Tenferro tensor operations. It uses tenferro-rs JVP and VJP transformations directly; it does not require Zygote or ChainRules rules.
+
+```julia
+using Tenferro, DifferentiationInterface
+
+x = [1.0 2.0; 3.0 4.0]
+f(x) = sum(x * x)
+
+gradient(f, AutoTenferro(), x)
+# [7.0 11.0; 9.0 13.0]
+```
+
+`pushforward` computes a Jacobian-vector product for each input tangent. `pullback` computes a vector-Jacobian product for each output cotangent. Both take an outer tuple of directions:
+
+```julia
+dx = ones(2, 2)
+(dy,) = pushforward(a -> a * a, AutoTenferro(), x, (dx,))
+# dy ≈ dx * x + x * dx
+
+seed = ones(2, 2)
+(dx_back,) = pullback(a -> a * a, AutoTenferro(), x, (seed,))
+# dx_back ≈ seed * x' + x' * seed
+```
+
+For multiple active inputs, pass a tuple as the single DifferentiationInterface input. Each tangent or returned cotangent follows that input structure:
+
+```julia
+f(x, y) = x * y
+y = [2.0 0.0; 0.0 3.0]
+((dx, dy),) = pullback(args -> f(args...), AutoTenferro(), (x, y), (seed,))
+# dx ≈ seed * y'; dy ≈ x' * seed
+
+gx, gy = gradient(args -> sum(f(args...)), AutoTenferro(), (x, y))
+```
+
+Seeds and tangents must match the corresponding value's shape and element type. Complex cotangents use the real Hermitian inner-product convention; a complex scalar gradient is a VJP with seed `one(eltype(output))`. See the [autodiff guide](docs/src/autodiff.md) for details.
+
+Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. The supported operations are `+`, `-`, matrix `*`, and `sum`. Addition, subtraction, and `sum` accept arbitrary ranks; matrix multiplication requires two-dimensional inputs. Eager `sum` currently fails on empty arrays.
+
+Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. Broadcasting, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
+
+## Tensor types
+
+- `TypedTensor(array)` wraps CPU tensor storage and implements Julia's `AbstractArray` interface. Conversion to and from Julia arrays copies the data. Supported element types are `Float32`, `Float64`, `Int32`, `Int64`, `Bool`, `ComplexF32`, and `ComplexF64`; arbitrary `Number` subtypes are not implicitly converted.
+- `EagerTensor(ctx, array)` executes operations eagerly in a shared `EagerContext` and records them for tenferro-rs AD. Tensors used in an operation must belong to the same context.
+- `TracedTensor(ctx, array)` builds a graph in a `TracedContext`. `AutoTenferroTraced()` exposes scalar gradients using traced graph transformations. Traced pushforwards, pullbacks, prepared execution, and symbolic inputs are not yet exposed.
 
 ```julia
 ctx = EagerContext()
@@ -20,56 +69,26 @@ b = EagerTensor(ctx, ones(2, 2))
 Array(a + b)
 ```
 
-The reverse rules take `EagerTensor` cotangents. They are first-order rules;
-the dynamic tensor wrapper remains to be implemented.
+## Optional ChainRules extension
 
-`AutoTenferro()` is a separate backend that differentiates with tenferro-rs,
-without Zygote. It currently accepts CPU arrays of `Float32`, `Float64`, `ComplexF32` or `ComplexF64` and supports
-matrix multiplication, addition, subtraction, and reduction to a scalar.
-Its reverse pass composes the ChainRulesCore `rrule` pullbacks registered by
-these operations; binary rules call tenferro-rs VJPs:
+Loading `ChainRulesCore` together with Tenferro activates the `TenferroChainRulesCoreExt` package extension. It provides first-order `rrule`s for `+`, `-`, matrix `*`, and `sum` on `EagerTensor`:
 
 ```julia
-using Tenferro, DifferentiationInterface
-x = [1.0 2.0; 3.0 4.0]
-f(x) = sum(x * x)
-grad = DifferentiationInterface.gradient(f, AutoTenferro(), x)
-# [7.0 11.0; 9.0 13.0]
+using Tenferro, ChainRulesCore
+
+ctx = EagerContext()
+x = EagerTensor(ctx, [1.0 2.0; 3.0 4.0])
+output, back = rrule(*, x, x)
+_, dx1, dx2 = back(EagerTensor(ctx, ones(2, 2)))
 ```
 
-For multiple active inputs, pass a tuple as the single input to
-DifferentiationInterface. Matrix outputs can be differentiated with a pullback:
+The pullbacks return `EagerTensor` cotangents. Compatibility with a particular external AD engine is not guaranteed. This extension is separate from Tenferro's own `AutoTenferro()` backend.
 
-```julia
-f(x, y) = x * y
-x = [1.0 2.0; 3.0 4.0]
-y = [2.0 0.0; 0.0 3.0]
-seed = ones(2, 2)
-((dx, dy),) = DifferentiationInterface.pullback(
-    args -> f(args...), AutoTenferro(), (x, y), (seed,)
-)
-# dx == seed * y'; dy == x' * seed
+## Tests and documentation
 
-dx, dy = DifferentiationInterface.gradient(
-    args -> sum(f(args...)), AutoTenferro(), (x, y)
-)
-```
+Run the test suite with `julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'`. Tests use ParallelTestRunner, Aqua, JET, and FiniteDiff.
 
-Each pullback seed must match the output array’s shape and element type. The
-outer result tuple contains one input-gradient tuple per seed.
-
-`AutoTenferro` is experimental: arbitrary Julia functions, broadcasting,
-other numeric element types, prepared calls, forward mode, and higher derivatives are not
-yet supported. The function must return the result of a supported reduction;
-unsupported operations are not silently differentiated by another backend.
-Only operations integrated with the eager tape are recorded; an arbitrary Julia
-function with an `rrule` is not automatically intercepted.
-
-
-Run the test suite with `Pkg.test(; test_args=["--jobs=2"])`. Test files run
-through ParallelTestRunner; package checks use Aqua and JET.
-
-To build the DocumenterVitepress documentation locally:
+Build the DocumenterVitepress documentation locally with:
 
 ```sh
 julia --project=docs -e 'using Pkg; Pkg.instantiate(; workspace=true)'
@@ -77,9 +96,3 @@ julia --project=docs docs/make.jl
 ```
 
 Serve `docs/build/1` over HTTP to preview the generated site.
-
-`TypedTensor` supports CPU arrays with element types `Float32`, `Float64`,
-`Int32`, `Int64`, `Bool`, `ComplexF32`, and `ComplexF64`. Eager and traced automatic
-differentiation supports the floating-point and complex types; arbitrary
-`Number` subtypes are not implicitly converted. Addition, subtraction and
-`sum` support arbitrary array ranks, while `*` currently requires matrices.

@@ -1,3 +1,10 @@
+module TenferroChainRulesCoreExt
+
+using ChainRulesCore
+using Tenferro: EagerTensor, EagerContext
+using Tenferro: _rust_call, RustCrate
+using RustCall
+
 # ChainRules reverse rules for Tenferro eager operations.
 
 function ChainRulesCore.rrule(::typeof(sum), a::EagerTensor)
@@ -36,4 +43,6 @@ function ChainRulesCore.rrule(op::Union{typeof(+),typeof(-),typeof(*)}, a::Eager
         return NoTangent(), vjp(rule_a), vjp(rule_b)
     end
     return output, pullback
+end
+
 end
