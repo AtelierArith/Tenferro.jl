@@ -1,7 +1,19 @@
+mod rem_extension;
+
 use rustcall_julia_macros::julia;
 use tenferro_ad::{EagerRuntime, EagerTensor, Tensor};
 
 type FfiResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+fn float_dtype(kind: i32) -> FfiResult<tenferro_ad::DType> {
+    Ok(match kind {
+        0 => tenferro_ad::DType::F32,
+        1 => tenferro_ad::DType::F64,
+        4 => tenferro_ad::DType::C32,
+        5 => tenferro_ad::DType::C64,
+        _ => return Err("unsupported promotion dtype".into()),
+    })
+}
 
 unsafe fn input_tensor(
     data: *const u8,
@@ -65,34 +77,6 @@ unsafe fn copy_tensor(value: &Tensor, out: *mut u8, len: usize, kind: i32) -> Ff
     Ok(())
 }
 
-macro_rules! copy_guard {
-    ($value:expr, $out:expr, $len:expr, $kind:expr) => {{
-        macro_rules! copy {
-            ($ty:ty) => {{
-                let values = $value.as_slice::<$ty>()?;
-                if values.len() != $len {
-                    return Err("shape mismatch".into());
-                }
-                if $len > 0 {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(values.as_ptr(), $out.cast::<$ty>(), $len)
-                    };
-                }
-            }};
-        }
-        match $kind {
-            0 => copy!(f32),
-            1 => copy!(f64),
-            2 => copy!(i32),
-            3 => copy!(i64),
-            6 => copy!(bool),
-            4 => copy!(num_complex::Complex32),
-            5 => copy!(num_complex::Complex64),
-            _ => return Err("unsupported element type".into()),
-        }
-    }};
-}
-
 #[julia]
 pub struct EagerGraph {
     ctx: Option<std::sync::Arc<EagerRuntime>>,
@@ -104,7 +88,14 @@ pub struct EagerGraph {
 impl EagerGraph {
     #[julia]
     pub fn new() -> Self {
-        match EagerRuntime::new() {
+        let runtime = (|| -> FfiResult<std::sync::Arc<EagerRuntime>> {
+            let ad = tenferro_ad::AdContext::builder()
+                .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
+                .with_semantic_extension_rules(rem_extension::rules()?)?
+                .build()?;
+            Ok(EagerRuntime::with_ad_context(&ad)?)
+        })();
+        match runtime {
             Ok(ctx) => Self {
                 ctx: Some(ctx),
                 init_error: String::new(),
@@ -152,8 +143,14 @@ impl EagerGraph {
         kind: i32,
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
-            let value = self.nodes.get(node).ok_or("invalid node")?.value()?;
-            copy_guard!(value, out, len, kind);
+            let value = self
+                .nodes
+                .get(node)
+                .ok_or("invalid node")?
+                .to_tensor(&mut tenferro_cpu::CpuEngine::serial())?;
+            unsafe {
+                copy_tensor(&value, out, len, kind)?;
+            }
             Ok(())
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
@@ -205,6 +202,308 @@ impl EagerGraph {
     }
 
     #[julia]
+    pub fn unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => s.neg(x),
+                    1 => s.exp(x),
+                    2 => s.log(x),
+                    3 => s.sqrt(x),
+                    4 => s.sin(x),
+                    5 => s.cos(x),
+                    6 => s.tanh(x),
+                    7 => s.expm1(x),
+                    8 => s.log1p(x),
+                    9 => s.conj(x),
+                    10 => s.sign(x),
+                    11 => s.abs(x),
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn convert_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let dtype = float_dtype(kind)?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.convert(x, dtype)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn gather_vector(&mut self, input: usize, indices: usize) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let ix = self.nodes.get(indices).ok_or("invalid indices")?;
+            let config = tenferro_ad::GatherConfig {
+                offset_dims: vec![],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                slice_sizes: vec![1],
+            };
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.gather(x, ix, config)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn concatenate(
+        &mut self,
+        data: *const usize,
+        len: usize,
+        axis: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let ids = if len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, len) }
+            };
+            let inputs: Vec<&EagerTensor> = ids
+                .iter()
+                .map(|id| self.nodes.get(*id).ok_or("invalid input"))
+                .collect::<Result<_, _>>()?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.concatenate(&inputs, axis)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn linalg_factor(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        use tenferro_linalg::EagerSessionLinalgExt;
+        let result = (|| -> FfiResult<Vec<EagerTensor>> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => {
+                        let (u, v, w) = s.svd(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![u, v, w])
+                    }
+                    1 => {
+                        let (q, r) = s.qr(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![q, r])
+                    }
+                    2 => {
+                        let (v, w) = s.eig(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![v, w])
+                    }
+                    3 => {
+                        let (v, w) = s.eigh(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![v, w])
+                    }
+                    4 => {
+                        let (p, l, u, parity) = s.lu(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![p, l, u, parity])
+                    }
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let values = result.map_err(|err| err.to_string())?;
+        let first = self.nodes.len() as i64;
+        self.nodes.extend(values);
+        Ok(first)
+    }
+
+    #[julia]
+    pub fn norm_node(&mut self, input: usize) -> Result<i64, String> {
+        use tenferro_linalg::EagerSessionLinalgExt;
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.norm(x, None, None, false)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn linalg_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        use tenferro_linalg::EagerSessionLinalgExt;
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => s.det(x),
+                    1 => s.inv(x),
+                    2 => s.pinv(x),
+                    3 => s.cholesky(x),
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn linalg_solve(
+        &mut self,
+        lhs: usize,
+        rhs: usize,
+        least_squares: bool,
+    ) -> Result<i64, String> {
+        use tenferro_linalg::{EagerSessionLinalgExt, EagerTensorLinalgExt};
+        let result = (|| -> FfiResult<EagerTensor> {
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            if least_squares {
+                let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+                Ok(
+                    ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                        s.lstsq(a, b)
+                    })?,
+                )
+            } else {
+                Ok(a.solve(&mut tenferro_cpu::CpuEngine::serial(), b)?)
+            }
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn matrix_structure(&mut self, input: usize, op: i32, k: i64) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => s.tril(x, k),
+                    1 => s.triu(x, k),
+                    2 => s.extract_diag(x, 0, 1),
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn slice_node(
+        &mut self,
+        input: usize,
+        data: *const usize,
+        rank: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let values = if rank == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, 3 * rank) }
+            };
+            let config = tenferro_ad::SliceConfig {
+                starts: values[..rank].to_vec(),
+                limits: values[rank..2 * rank].to_vec(),
+                strides: values[2 * rank..].to_vec(),
+            };
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.slice(x, config)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn broadcast_to(
+        &mut self,
+        input: usize,
+        shape: *const usize,
+        rank: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let shape = if rank == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(shape, rank) }
+            };
+            let dims: Vec<usize> = (0..x.shape().len()).collect();
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.broadcast_in_dim(x, shape, &dims)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn shape_op(
+        &mut self,
+        input: usize,
+        values: *const usize,
+        len: usize,
+        op: i32,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let args = if len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(values, len) }
+            };
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => s.reshape(x, args),
+                    1 => s.transpose(x, args),
+                    2 => s.reduce_sum(x, Some(args)),
+                    3 => s.reverse(x, args),
+                    4 => s.reduce_prod(x, Some(args)),
+                    5 => s.reduce_max(x, Some(args)),
+                    6 => s.reduce_min(x, Some(args)),
+                    7 => s.reduce_mean(x, Some(args)),
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
     pub fn binary(&mut self, lhs: usize, rhs: usize, op: i32) -> Result<i64, String> {
         let result = (|| -> Result<EagerTensor, Box<dyn std::error::Error>> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
@@ -213,7 +512,36 @@ impl EagerGraph {
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
                     0 => s.add(a, b),
-                    _ => s.sub(a, b),
+                    1 => s.sub(a, b),
+                    2 => s.mul(a, b),
+                    3 => s.div(a, b),
+                    4 => s.pow(a, b),
+                    5 => {
+                        let values =
+                            tenferro_ad::extension::apply_eager_with_targeted_extension_in_session(
+                                s,
+                                std::sync::Arc::new(rem_extension::Remainder),
+                                &[a, b],
+                                |target| {
+                                    rem_extension::extension_module::<tenferro_cpu::CpuEngine>(
+                                        target.engine_id,
+                                    )
+                                    .map_err(|e| {
+                                        tenferro_runtime::Error::runtime_state_source(
+                                            "remainder extension",
+                                            tenferro_runtime::ErrorPhase::Execution,
+                                            e,
+                                        )
+                                    })
+                                },
+                            )?;
+                        values.into_iter().next().ok_or_else(|| {
+                            tenferro_ad::Error::Internal("missing remainder output".into())
+                        })
+                    }
+                    6 => s.maximum(a, b),
+                    7 => s.minimum(a, b),
+                    _ => unreachable!(),
                 })?,
             )
         })();
@@ -301,6 +629,12 @@ impl TracedGraph {
             let mut engine = tenferro_cpu::CpuEngine::serial();
             let mut builder = Runtime::builder();
             builder.register_engine(tenferro_cpu::runtime_engine_registration(&engine)?)?;
+            builder.install_extension_module(rem_extension::extension_module::<
+                tenferro_cpu::CpuEngine,
+            >(tenferro_cpu::runtime_engine_id()?)?)?;
+            builder.install_extension_module(tenferro_linalg::extension_module::<
+                tenferro_cpu::CpuEngine,
+            >(tenferro_cpu::runtime_engine_id()?)?)?;
             let runtime = builder.build()?;
             let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
             let mut outputs = runtime.run(&mut [&mut engine], &prepared, &[])?;
@@ -314,6 +648,262 @@ impl TracedGraph {
     }
 
     #[julia]
+    pub fn traced_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(match op {
+                0 => x.neg()?,
+                1 => x.exp()?,
+                2 => x.log()?,
+                3 => x.sqrt()?,
+                4 => x.sin()?,
+                5 => x.cos()?,
+                6 => x.tanh()?,
+                7 => x.expm1()?,
+                8 => x.log1p()?,
+                9 => x.conj()?,
+                10 => x.sign()?,
+                11 => x.abs()?,
+                _ => unreachable!(),
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_convert_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(x.convert(float_dtype(kind)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_gather_vector(&mut self, input: usize, indices: usize) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let ix = self.nodes.get(indices).ok_or("invalid indices")?;
+            let config = tenferro_runtime::GatherConfig {
+                offset_dims: vec![],
+                collapsed_slice_dims: vec![0],
+                start_index_map: vec![0],
+                index_vector_dim: 1,
+                slice_sizes: vec![1],
+            };
+            Ok(x.gather(ix, config)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_concatenate(
+        &mut self,
+        data: *const usize,
+        len: usize,
+        axis: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let ids = if len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, len) }
+            };
+            let inputs: Vec<&tenferro_runtime::TracedTensor> = ids
+                .iter()
+                .map(|id| self.nodes.get(*id).ok_or("invalid input"))
+                .collect::<Result<_, _>>()?;
+            Ok(tenferro_runtime::TracedTensor::concatenate(&inputs, axis)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_linalg_factor(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        use tenferro_linalg::TracedTensorLinalgExt;
+        let result = (|| -> FfiResult<Vec<tenferro_runtime::TracedTensor>> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(match op {
+                0 => {
+                    let (u, v, w) = x.svd()?;
+                    vec![u, v, w]
+                }
+                1 => {
+                    let (q, r) = x.qr()?;
+                    vec![q, r]
+                }
+                2 => {
+                    let (v, w) = x.eig()?;
+                    vec![v, w]
+                }
+                3 => {
+                    let (v, w) = x.eigh()?;
+                    vec![v, w]
+                }
+                4 => {
+                    let (p, l, u, parity) = x.lu()?;
+                    vec![p, l, u, parity]
+                }
+                _ => unreachable!(),
+            })
+        })();
+        let values = result.map_err(|err| err.to_string())?;
+        let first = self.nodes.len() as i64;
+        self.nodes.extend(values);
+        Ok(first)
+    }
+
+    #[julia]
+    pub fn traced_norm_node(&mut self, input: usize) -> Result<i64, String> {
+        use tenferro_linalg::TracedTensorLinalgExt;
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(x.norm(None, None, false)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_linalg_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        use tenferro_linalg::TracedTensorLinalgExt;
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(match op {
+                0 => x.det()?,
+                1 => x.inv()?,
+                2 => x.pinv()?,
+                3 => x.cholesky()?,
+                _ => unreachable!(),
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_linalg_solve(
+        &mut self,
+        lhs: usize,
+        rhs: usize,
+        least_squares: bool,
+    ) -> Result<i64, String> {
+        use tenferro_linalg::TracedTensorLinalgExt;
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            Ok(if least_squares {
+                a.lstsq(b)?
+            } else {
+                a.solve(b)?
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_matrix_structure(
+        &mut self,
+        input: usize,
+        op: i32,
+        k: i64,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(match op {
+                0 => x.tril(k)?,
+                1 => x.triu(k)?,
+                2 => x.extract_diag(0, 1)?,
+                _ => unreachable!(),
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_slice_node(
+        &mut self,
+        input: usize,
+        data: *const usize,
+        rank: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let values = if rank == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, 3 * rank) }
+            };
+            let config = tenferro_runtime::SliceConfig {
+                starts: values[..rank].to_vec(),
+                limits: values[rank..2 * rank].to_vec(),
+                strides: values[2 * rank..].to_vec(),
+            };
+            Ok(x.slice(config)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_broadcast_to(
+        &mut self,
+        input: usize,
+        shape: *const usize,
+        rank: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let shape = if rank == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(shape, rank) }
+            };
+            let dims: Vec<usize> = (0..x.rank).collect();
+            Ok(x.broadcast_in_dim(shape, &dims)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_shape_op(
+        &mut self,
+        input: usize,
+        values: *const usize,
+        len: usize,
+        op: i32,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let args = if len == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(values, len) }
+            };
+            Ok(match op {
+                0 => x.reshape(args)?,
+                1 => x.transpose(args)?,
+                2 => x.reduce_sum(Some(args))?,
+                3 => x.reverse(args)?,
+                4 => x.reduce_prod(Some(args))?,
+                5 => x.reduce_max(Some(args))?,
+                6 => x.reduce_min(Some(args))?,
+                7 => x.reduce_mean(Some(args))?,
+                _ => unreachable!(),
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
     pub fn traced_binary(&mut self, lhs: usize, rhs: usize, op: i32) -> Result<i64, String> {
         let result = (|| {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
@@ -321,7 +911,20 @@ impl TracedGraph {
             Ok(match op {
                 0 => a.add(b)?,
                 1 => a.sub(b)?,
-                _ => a.matmul(b)?,
+                2 => a.matmul(b)?,
+                3 => a.mul(b)?,
+                4 => a.div(b)?,
+                5 => a.pow(b)?,
+                6 => tenferro_runtime::extension::apply(
+                    std::sync::Arc::new(rem_extension::Remainder),
+                    &[a, b],
+                )?
+                .into_iter()
+                .next()
+                .ok_or("missing remainder output")?,
+                7 => a.maximum(b)?,
+                8 => a.minimum(b)?,
+                _ => unreachable!(),
             })
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
@@ -343,12 +946,15 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_grad(&mut self, output: usize, input: usize) -> Result<i64, String> {
-        use tenferro_ad::TracedTensorAdExt;
         let result: Result<Option<tenferro_runtime::TracedTensor>, Box<dyn std::error::Error>> =
             (|| {
                 let y = self.nodes.get(output).ok_or("invalid output")?;
                 let x = self.nodes.get(input).ok_or("invalid input")?;
-                Ok(y.grad_optional(x)?)
+                let ad = tenferro_ad::AdContext::builder()
+                    .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
+                    .with_semantic_extension_rules(rem_extension::rules()?)?
+                    .build()?;
+                Ok(ad.grad_optional(y, x)?)
             })();
         match result {
             Ok(Some(value)) => Ok(self.push(value)),

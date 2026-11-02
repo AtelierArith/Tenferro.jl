@@ -1,6 +1,8 @@
 module Tenferro
 
 using RustCall
+using Statistics
+using LinearAlgebra
 using ADTypes: AbstractADType
 import DifferentiationInterface
 

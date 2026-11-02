@@ -784,9 +784,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rustcall_julia_core"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "700d45c1c11148a48d714bc24a0d7cdd187e9341187636e4f1ff3f35e0b4c747"
+checksum = "6c33292dd688d362674e49cd33b7af5645dee7c12753bfa06b2f0f8c3c1bc567"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -798,18 +798,18 @@ dependencies = [
 
 [[package]]
 name = "rustcall_julia_macros"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8655e3ce12ba404b84a11fc15ed1c80309d88fbde2902483e71835898594b923"
+checksum = "f52cdf7f649ba8f8b9a8f94f661ad1681ea63f68f97aceb5a7d8daaa1c0e1d11"
 dependencies = [
  "rustcall_julia_macros_impl",
 ]
 
 [[package]]
 name = "rustcall_julia_macros_impl"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "109b70014d85de952a3003676c3de0223115e5bc6a59875fd1607ec1e4ecc48c"
+checksum = "a5e10806e32f957983129387a70d0aaf24beee3f3d9be7b84e5a56a1b53a4580"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1255,8 +1255,29 @@ dependencies = [
  "rustcall_julia_macros",
  "tenferro-ad",
  "tenferro-cpu",
+ "tenferro-linalg",
  "tenferro-runtime",
  "tenferro-tensor",
+]
+
+[[package]]
+name = "tenferro-linalg"
+version = "0.8.0"
+dependencies = [
+ "computegraph",
+ "num-complex",
+ "num-traits",
+ "strided-view",
+ "t4a-faer",
+ "tcontract-exec",
+ "tenferro-ad",
+ "tenferro-cpu",
+ "tenferro-internal-extension-macros",
+ "tenferro-internal-ops",
+ "tenferro-runtime",
+ "tenferro-tensor",
+ "thiserror 2.0.21",
+ "tlinalg",
 ]
 
 [[package]]
@@ -1363,6 +1384,20 @@ name = "tinyvec"
 version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
+name = "tlinalg"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "540c3d6d219aaf95226bcbbf37e3fbb7c85c069defeb66601399696648dc6cb0"
+dependencies = [
+ "num-complex",
+ "strided-view",
+ "t4a-faer",
+ "tcontract-exec",
+ "thiserror 2.0.21",
+ "threadteam",
+]
 
 [[package]]
 name = "toml"

@@ -52,9 +52,9 @@ gx, gy = gradient(args -> sum(f(args...)), AutoTenferro(), (x, y))
 
 Seeds and tangents must match the corresponding value's shape and element type. Complex cotangents use the real Hermitian inner-product convention; a complex scalar gradient is a VJP with seed `one(eltype(output))`. See the [autodiff guide](docs/src/autodiff.md) for details.
 
-Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. The supported operations are `+`, `-`, matrix `*`, and `sum`. Addition, subtraction, and `sum` accept arbitrary ranks; matrix multiplication requires two-dimensional inputs. Eager `sum` currently fails on empty arrays.
+Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, elementwise mathematical functions, reductions, shape and slicing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations. Eager `sum` currently fails on empty arrays.
 
-Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. Broadcasting, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
+Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. General Julia broadcast functions, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
 
 ## Tensor types
 

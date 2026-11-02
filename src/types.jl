@@ -3,8 +3,9 @@
 
 DifferentiationInterface backend for first-order gradients of scalar-valued
 functions built from supported tenferro operations on CPU arrays of Float32, Float64, ComplexF32, or ComplexF64.
-Supports addition, subtraction, matrix multiplication, and `sum`; gradients of
-scalar outputs, pullbacks and pushforwards for arrays or tuples of arrays.
+Supports tensor elementwise operations, reductions, shape operations and selected
+linear-algebra operations; gradients of scalar outputs, pullbacks and pushforwards
+for arrays or tuples of arrays.
 Differentiation uses tenferro-rs JVPs and VJPs, independent of ChainRules rules.
 """
 struct AutoTenferro <: AbstractADType end
@@ -111,3 +112,38 @@ TypedTensor(x::AbstractArray) = throw(ArgumentError("unsupported TypedTensor ele
 Base.eltype(::Type{<:EagerTensor{T}}) where {T} = T
 Base.eltype(::Type{<:EagerScalar{T}}) where {T} = T
 Base.eltype(::Type{<:TracedTensor{T}}) where {T} = T
+
+struct TensorSVD{U,S,V}
+    U::U
+    S::S
+    Vt::V
+end
+struct TensorQR{Q,R}
+    Q::Q
+    R::R
+end
+
+struct TensorCholesky{L}
+    L::L
+end
+
+struct TensorEigen{V,W}
+    values::V
+    vectors::W
+end
+
+struct TensorHermitian{A}
+    data::A
+    uplo::Symbol
+end
+
+struct TensorLU{P,L,U}
+    P::P
+    L::L
+    U::U
+end
+
+struct TensorTriangular{A}
+    data::A
+    lower::Bool
+end
