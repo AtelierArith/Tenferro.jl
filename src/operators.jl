@@ -154,12 +154,20 @@ end
 for (op, eager_code, traced_code) in ((:+, 0, 0), (:-, 1, 1), (:*, 2, 3), (:/, 3, 4), (:^, 4, 5), (:rem, 5, 6), (:max, 6, 7), (:min, 7, 8))
     @eval begin
         function Base.Broadcast.broadcasted(::typeof($op), lhs::EagerTensor, rhs::EagerTensor)
+            if $(op === :/)
+                T = Base.promote_op(/, eltype(lhs), eltype(rhs))
+                lhs, rhs = _convert_tensor(lhs, T), _convert_tensor(rhs, T)
+            end
             a, b = _broadcast_pair(lhs, rhs)
             T = eltype(a)
             id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.binary, UInt(a.id), UInt(b.id), Int32($eager_code)))
             return EagerTensor{T,length(a.dims),typeof(a.graph)}(a.graph, id, a.dims)
         end
         function Base.Broadcast.broadcasted(::typeof($op), lhs::TracedTensor, rhs::TracedTensor)
+            if $(op === :/)
+                T = Base.promote_op(/, eltype(lhs), eltype(rhs))
+                lhs, rhs = _convert_tensor(lhs, T), _convert_tensor(rhs, T)
+            end
             a, b = _broadcast_pair(lhs, rhs)
             T = eltype(a)
             id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_binary, UInt(a.id), UInt(b.id), Int32($traced_code)))
@@ -256,11 +264,11 @@ for op in (:*, :/)
     @eval Base.$op(a::_ADTensor, b::Number) = Base.Broadcast.broadcasted($op, a, b)
 end
 Base.:*(a::Number, b::_ADTensor) = Base.Broadcast.broadcasted(*, a, b)
-function Base.Broadcast.broadcasted(::typeof(abs), a::EagerTensor{T,N}) where {T<:ADElement,N}
+function Base.Broadcast.broadcasted(::typeof(abs), a::EagerTensor{T,N}) where {T<:TensorElement,N}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.unary, UInt(a.id), Int32(11)))
     EagerTensor{typeof(real(zero(T))),N,typeof(a.graph)}(a.graph, id, a.dims)
 end
-function Base.Broadcast.broadcasted(::typeof(abs), a::TracedTensor{T,N}) where {T<:ADElement,N}
+function Base.Broadcast.broadcasted(::typeof(abs), a::TracedTensor{T,N}) where {T<:TensorElement,N}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_unary, UInt(a.id), Int32(11)))
     TracedTensor{typeof(real(zero(T))),N,typeof(a.graph)}(a.graph, id, a.dims)
 end
@@ -517,11 +525,11 @@ Base.:\(a::TensorTriangular, b::Union{_ADTensor,AbstractArray}) = (a.lower ? tri
 
 for op in (:+, :-)
     @eval begin
-        function Base.$op(a::EagerTensor{T,N}, b::EagerTensor{S,N}) where {T,S,N}
+        function Base.$op(a::EagerTensor{T,N}, b::EagerTensor{S,M}) where {T,S,N,M}
             a.dims == b.dims || throw(DimensionMismatch("tensor shapes do not match"))
             Base.Broadcast.broadcasted($op, a, b)
         end
-        function Base.$op(a::TracedTensor{T,N}, b::TracedTensor{S,N}) where {T,S,N}
+        function Base.$op(a::TracedTensor{T,N}, b::TracedTensor{S,M}) where {T,S,N,M}
             a.dims == b.dims || throw(DimensionMismatch("tensor shapes do not match"))
             Base.Broadcast.broadcasted($op, a, b)
         end

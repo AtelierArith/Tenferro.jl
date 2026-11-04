@@ -58,6 +58,9 @@ Arbitrary Julia functions are supported only when their tensor operations are su
 
 ## Tensor types
 
+Detailed axis, dtype, domain, ownership, and factorization contracts are in the
+[operation guide](docs/src/operations.md).
+
 - `TypedTensor(array)` wraps CPU tensor storage and implements Julia's `AbstractArray` interface. Conversion to and from Julia arrays copies the data. Supported element types are `Float32`, `Float64`, `Int32`, `Int64`, `Bool`, `ComplexF32`, and `ComplexF64`; arbitrary `Number` subtypes are not implicitly converted.
 - `EagerTensor(ctx, array)` executes operations eagerly in a shared `EagerContext` and records them for tenferro-rs AD. Tensors used in an operation must belong to the same context.
 - `TracedTensor(ctx, array)` builds a graph in a `TracedContext`. `AutoTenferroTraced()` exposes scalar gradients using traced graph transformations. Traced pushforwards, pullbacks, prepared execution, and symbolic inputs are not yet exposed.
