@@ -16,6 +16,7 @@ makedocs(;
         "Home" => "index.md",
         "Getting started" => "getting-started.md",
         "Automatic differentiation" => "autodiff.md",
+        "Operation contracts" => "operations.md",
         "API reference" => "api.md",
     ],
     checkdocs = :exports,
