@@ -8,10 +8,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 rustcall_julia_macros = "0.5"
-tenferro-ad = { path = "../../extern/tenferro-rs/crates/tenferro-ad" }
-tenferro-linalg = { path = "../../extern/tenferro-rs/crates/tenferro-linalg", features = ["autodiff"] }
-tenferro-cpu = { path = "../../extern/tenferro-rs/crates/tenferro-cpu" }
-tenferro-runtime = { path = "../../extern/tenferro-rs/crates/tenferro-runtime" }
-tenferro-tensor = { path = "../../extern/tenferro-rs/crates/tenferro-tensor" }
+tenferro-ad = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-ad" }
+tenferro-linalg = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-linalg", features = ["autodiff"] }
+tenferro-cpu = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-cpu" }
+tenferro-runtime = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-runtime" }
+tenferro-tensor = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-tensor" }
 
 num-complex = "0.4"
