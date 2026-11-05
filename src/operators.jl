@@ -26,6 +26,7 @@ end
 
 function Base.sum(a::EagerTensor{T}; dims=:) where {T}
     dims isa Colon || return _reduce_dims(a, dims, 2)
+    length(a) == 0 && return _empty_reduction(a, :, 2)
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.sum, UInt(a.id)))
     id >= 0 || error("tenferro-rs reduction failed")
     EagerScalar{T,typeof(a.graph)}(a.graph, id)
@@ -59,6 +60,7 @@ end
 
 function Base.sum(a::TracedTensor{T}; dims=:) where {T}
     dims isa Colon || return _reduce_dims(a, dims, 2)
+    length(a) == 0 && return _empty_reduction(a, :, 2)
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_sum, UInt(a.id)))
     id >= 0 || error("tenferro-rs traced reduction failed")
     return TracedTensor{T,0,typeof(a.graph)}(a.graph, id, ())
@@ -226,22 +228,35 @@ end
 Base.adjoint(a::_ADTensor) = conj(transpose(a))
 
 Base.Broadcast.broadcasted(::typeof(Base.literal_pow), ::typeof(^), a::_ADTensor, ::Val{P}) where {P} = Base.Broadcast.broadcasted(^, a, P)
+# An empty input contains no differentiable values. Delegate identity and error
+# semantics to Julia and record the result as an independent graph input.
+function _empty_reduction(a::_ADTensor, dims, op)
+    f = op == 2 ? sum : op == 4 ? prod : op == 5 ? maximum : op == 6 ? minimum : Statistics.mean
+    input = Array{eltype(a)}(undef, a.dims)
+    value = f(input; dims=dims)
+    tensor = _constant_tensor(a, value isa AbstractArray ? value : fill(value))
+    return dims isa Colon && tensor isa EagerTensor ? _scalar_result(tensor) : tensor
+end
+
 function _reduce_dims(a::_ADTensor, dims, op)
     axes = dims isa Integer ? (dims,) : Tuple(dims)
     all(d -> d isa Integer && d >= 1, axes) || throw(ArgumentError("dimensions must be positive integers"))
     length(unique(axes)) == length(axes) || throw(ArgumentError("dimensions must be unique"))
     axes = Tuple(d for d in axes if d <= length(a.dims))
     isempty(axes) && return a
+    length(a) == 0 && return _empty_reduction(a, axes, op)
     reduced = Tuple(a.dims[i] for i in eachindex(a.dims) if !(i in axes))
     retained = ntuple(i -> i in axes ? 1 : a.dims[i], length(a.dims))
     reshape(_shape_op(a, axes .- 1, op, reduced), retained)
 end
 
 function _reduce_all(a::EagerTensor{T}, op) where {T}
+    length(a) == 0 && return _empty_reduction(a, :, op)
     y = _shape_op(a, ntuple(i -> i - 1, length(a.dims)), op, ())
     EagerScalar{T,typeof(a.graph)}(a.graph, y.id)
 end
 function _reduce_all(a::TracedTensor, op)
+    length(a) == 0 && return _empty_reduction(a, :, op)
     _shape_op(a, ntuple(i -> i - 1, length(a.dims)), op, ())
 end
 for (op, code) in ((:prod, 4), (:maximum, 5), (:minimum, 6))

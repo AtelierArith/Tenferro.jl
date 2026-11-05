@@ -653,3 +653,46 @@ end
         @test back ≈ derivative.(x) .* seed
     end
 end
+
+@testset "empty reductions follow Julia" begin
+    using Statistics
+    for (Context, TensorType) in ((EagerContext, EagerTensor), (TracedContext, TracedTensor)),
+        T in (Float32, Float64, ComplexF32, ComplexF64), shape in ((0,), (0, 3), (2, 0)),
+        op in (sum, prod, maximum, minimum, mean), dims in (1, 2)
+        input = zeros(T, shape)
+        tensor = TensorType(Context(), input)
+        expected = try
+            op(input; dims=dims)
+        catch err
+            err
+        end
+        if expected isa Exception
+            @test_throws typeof(expected) op(tensor; dims=dims)
+        else
+            @test isequal(Array(op(tensor; dims=dims)), expected)
+        end
+    end
+    for backend in (AutoTenferro(), AutoTenferroTraced()), op in (sum, prod),
+        input in (Float64[], zeros(0, 3), zeros(2, 0))
+        @test gradient(op, backend, input) == input
+        @test gradient(x -> sum(op(x; dims=1)), backend, input) == input
+    end
+    for op in (sum, prod)
+        x = zeros(0, 3)
+        (dy,) = pushforward(op, AutoTenferro(), x, (x,))
+        (dx,) = pullback(op, AutoTenferro(), x, (1.0,))
+        @test dy == 0.0
+        @test dx == x
+    end
+end
+
+@testset "real mathematical domain behavior" begin
+    for (Context, TensorType) in ((EagerContext, EagerTensor), (TracedContext, TracedTensor)),
+        T in (Float32, Float64), (op, invalid, boundary) in ((log, -1, 0), (sqrt, -1, 0), (log1p, -2, -1))
+        x = T[invalid, boundary]
+        result = Array(op.(TensorType(Context(), x)))
+        @test isnan(result[1])
+        @test_throws DomainError op(x[1])
+        @test isequal(result[2], op(x[2]))
+    end
+end

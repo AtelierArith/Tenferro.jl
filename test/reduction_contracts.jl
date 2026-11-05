@@ -25,16 +25,10 @@ end
 
         ctx = Context()
         x = TensorType(ctx, zeros(T, 0, 2))
-        for op in (sum, prod, maximum, minimum)
-            err = try
-                Array(op(x; dims = 1))
-                nothing
-            catch e
-                e
-            end
-            @test !isnothing(err)
-            @test occursin("zero-length axis", sprint(showerror, err))
-        end
+        @test Array(sum(x; dims = 1)) == zeros(T, 1, 2)
+        @test Array(prod(x; dims = 1)) == ones(T, 1, 2)
+        @test_throws ArgumentError maximum(x; dims = 1)
+        @test_throws ArgumentError minimum(x; dims = 1)
         @test all(isnan, Array(mean(x; dims = 1)))
         @test sum(zeros(T, 0, 2); dims = 1) == zeros(T, 1, 2)
         @test prod(zeros(T, 0, 2); dims = 1) == ones(T, 1, 2)
