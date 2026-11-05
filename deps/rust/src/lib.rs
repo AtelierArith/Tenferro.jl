@@ -1028,28 +1028,31 @@ enum TypedData {
 macro_rules! typed_match {
     ($data:expr, |$tensor:ident| $body:expr) => {
         match $data {
-            Some(TypedData::Bool($tensor)) => $body,
-            Some(TypedData::F32($tensor)) => $body,
-            Some(TypedData::F64($tensor)) => $body,
-            Some(TypedData::I32($tensor)) => $body,
-            Some(TypedData::I64($tensor)) => $body,
-            Some(TypedData::C32($tensor)) => $body,
-            Some(TypedData::C64($tensor)) => $body,
-            None => 1,
+            TypedData::Bool($tensor) => $body,
+            TypedData::F32($tensor) => $body,
+            TypedData::F64($tensor) => $body,
+            TypedData::I32($tensor) => $body,
+            TypedData::I64($tensor) => $body,
+            TypedData::C32($tensor) => $body,
+            TypedData::C64($tensor) => $body,
         }
     };
 }
 
 #[julia]
 pub struct TypedStorage {
-    data: Option<TypedData>,
-    error: String,
+    data: TypedData,
 }
 
 #[julia]
 impl TypedStorage {
     #[julia]
-    pub fn new(data: *const u8, shape: *const usize, rank: usize, kind: i32) -> Self {
+    pub fn new(
+        data: *const u8,
+        shape: *const usize,
+        rank: usize,
+        kind: i32,
+    ) -> Result<Self, String> {
         let result = (|| -> Result<TypedData, Box<dyn std::error::Error>> {
             let dims = if rank == 0 {
                 vec![]
@@ -1140,24 +1143,9 @@ impl TypedStorage {
                 _ => return Err("unsupported element type".into()),
             })
         })();
-        match result {
-            Ok(data) => Self {
-                data: Some(data),
-                error: String::new(),
-            },
-            Err(err) => Self {
-                data: None,
-                error: err.to_string(),
-            },
-        }
-    }
-    #[julia]
-    pub fn typed_valid(&self) -> bool {
-        self.data.is_some()
-    }
-    #[julia]
-    pub fn typed_error(&self) -> String {
-        self.error.clone()
+        result
+            .map(|data| Self { data })
+            .map_err(|err| err.to_string())
     }
     #[julia]
     pub fn typed_copy(&self, out: *mut u8, len: usize) -> i32 {

@@ -100,9 +100,8 @@ _typed_kind(::Type{Bool}) = Int32(6)
 function TypedTensor(x::AbstractArray{T,N}) where {T<:TypedElement,N}
     dims = size(x)
     storage = _with_input_buffer(x) do data, shape, rank
-        _RustState(RustCrate.TypedStorage(data, shape, rank, _typed_kind(T)))
+        _RustState(RustCall.result_to_exception(RustCrate.TypedStorage(data, shape, rank, _typed_kind(T))))
     end
-    _rust_call(storage, RustCrate.typed_valid) || error("tenferro-rs could not create typed tensor: ", _rust_call(storage, RustCrate.typed_error))
     return TypedTensor{T,N,typeof(storage)}(storage, dims)
 end
 TypedTensor(x::AbstractArray) = throw(ArgumentError("unsupported TypedTensor element type: $(eltype(x))"))

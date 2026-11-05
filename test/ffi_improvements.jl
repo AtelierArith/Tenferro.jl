@@ -30,3 +30,18 @@ end
         @test Array(TensorType(Context(), ones(1, 1))) == ones(1, 1)
     end
 end
+
+@testset "fallible typed storage construction" begin
+    err = try
+        Tenferro._with_input_buffer([1.0]) do data, shape, rank
+            Tenferro.RustCall.result_to_exception(
+                Tenferro.RustCrate.TypedStorage(data, shape, rank, Int32(-1)))
+        end
+        nothing
+    catch e
+        e
+    end
+    @test err isa Tenferro.RustCall.RustError
+    @test occursin("unsupported element type", sprint(showerror, err))
+    @test Array(TypedTensor([1.0])) == [1.0]
+end
