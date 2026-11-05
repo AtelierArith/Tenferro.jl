@@ -1,10 +1,11 @@
 # Raw pointers passed to Rust are valid only for the duration of each callback.
-# Array(x) materializes a dense, column-major owner for views and other arrays.
+# RustCall supplies a contiguous copy, including for views and empty inputs.
 function _with_input_buffer(f, x::AbstractArray)
-    data = Array(x)
-    shape = UInt[size(data)...]
-    GC.@preserve data shape begin
-        return f(Ptr{UInt8}(pointer(data)), pointer(shape), UInt(ndims(data)))
+    shape = UInt[size(x)...]
+    RustCall.with_numeric_buffer(x) do data, _
+        RustCall.with_numeric_buffer(shape) do dims, rank
+            f(Ptr{UInt8}(data), dims, rank)
+        end
     end
 end
 
