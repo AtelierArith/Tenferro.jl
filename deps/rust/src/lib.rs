@@ -220,6 +220,7 @@ impl EagerGraph {
                     9 => s.conj(x),
                     10 => s.sign(x),
                     11 => s.abs(x),
+                    12 => s.erf(x),
                     _ => unreachable!(),
                 })?,
             )
@@ -664,6 +665,7 @@ impl TracedGraph {
                 9 => x.conj()?,
                 10 => x.sign()?,
                 11 => x.abs()?,
+                12 => x.erf()?,
                 _ => unreachable!(),
             })
         })();
@@ -942,6 +944,35 @@ impl TracedGraph {
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
         Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_derivative(
+        &mut self,
+        output: usize,
+        input: usize,
+        seed: usize,
+        forward: bool,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<Option<tenferro_runtime::TracedTensor>> {
+            let y = self.nodes.get(output).ok_or("invalid output")?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let seed = self.nodes.get(seed).ok_or("invalid seed")?;
+            let ad = tenferro_ad::AdContext::builder()
+                .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
+                .with_semantic_extension_rules(rem_extension::rules()?)?
+                .build()?;
+            Ok(if forward {
+                ad.jvp_optional(y, x, seed)?
+            } else {
+                ad.vjp_optional(y, x, seed)?
+            })
+        })();
+        match result {
+            Ok(Some(value)) => Ok(self.push(value)),
+            Ok(None) => Ok(-2),
+            Err(err) => Err(err.to_string()),
+        }
     }
 
     #[julia]

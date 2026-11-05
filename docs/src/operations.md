@@ -101,10 +101,9 @@ the [ChainRules product rule](https://github.com/JuliaDiff/ChainRules.jl/blob/ma
 These comparisons do not install or invoke ChainRules during Tenferro AD. Complex
 `sum`, `prod`, and `mean` are supported; complex extrema are not.
 
-On zero-length reduced axes, both backends reject `sum(...; dims=...)`,
-`prod`, `maximum`, and `minimum`; `mean` returns `NaN`. In contrast Julia
-returns zero/one for sum/product and errors for extrema. The sum/product
-identity extension is tracked in
+On zero-length reduced axes, the Julia wrapper supplies the sum/product
+identities, `mean` returns `NaN`, and `maximum`/`minimum` throw as in Julia.
+The backend identity extension is tracked in
 [tenferro-rs#2453](https://github.com/tensor4all/tenferro-rs/issues/2453).
 A zero-length *non-reduced* dimension gives an empty output with the expected
 shape. An empty input is distinct from an empty tuple of reduction axes.

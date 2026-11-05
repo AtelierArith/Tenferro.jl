@@ -55,7 +55,7 @@ gx, gy = gradient(args -> sum(f(args...)), AutoTenferro(), (x, y))
 
 Seeds and tangents must match the corresponding value's shape and element type. Complex cotangents use the real Hermitian inner-product convention; a complex scalar gradient is a VJP with seed `one(eltype(output))`. See the [autodiff guide](docs/src/autodiff.md) for details.
 
-Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, elementwise mathematical functions, reductions, shape and slicing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations. Eager `sum` currently fails on empty arrays.
+Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, elementwise mathematical functions, reductions, shape and slicing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations.
 
 Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. General Julia broadcast functions, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
 
@@ -66,7 +66,7 @@ Detailed axis, dtype, domain, ownership, and factorization contracts are in the
 
 - `TypedTensor(array)` wraps CPU tensor storage and implements Julia's `AbstractArray` interface. Conversion to and from Julia arrays copies the data. Supported element types are `Float32`, `Float64`, `Int32`, `Int64`, `Bool`, `ComplexF32`, and `ComplexF64`; arbitrary `Number` subtypes are not implicitly converted.
 - `EagerTensor(ctx, array)` executes operations eagerly in a shared `EagerContext` and records them for tenferro-rs AD. Tensors used in an operation must belong to the same context.
-- `TracedTensor(ctx, array)` builds a graph in a `TracedContext`. `AutoTenferroTraced()` exposes scalar gradients using traced graph transformations. Traced pushforwards, pullbacks, prepared execution, and symbolic inputs are not yet exposed.
+- `TracedTensor(ctx, array)` builds a graph in a `TracedContext`. `AutoTenferroTraced()` exposes gradients, pushforwards and pullbacks using traced graph transformations. Prepared execution and symbolic inputs are not yet exposed.
 
 ```julia
 ctx = EagerContext()
