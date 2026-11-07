@@ -15,30 +15,85 @@ fn float_dtype(kind: i32) -> FfiResult<tenferro_ad::DType> {
     })
 }
 
-unsafe fn input_tensor(
-    data: *const u8,
-    shape: *const usize,
-    rank: usize,
-    kind: i32,
-) -> FfiResult<Tensor> {
-    let dims = if rank == 0 {
-        vec![]
-    } else {
-        std::slice::from_raw_parts(shape, rank).to_vec()
-    };
-    let len = dims
+/// Element types exchanged with Julia as native-endian bytes.
+///
+/// RustCall checks each byte slice's span and lifetime; decoding here checks
+/// the length and never reinterprets bytes as a typed reference.
+trait HostElement: Copy {
+    const SIZE: usize;
+    fn read(bytes: &[u8]) -> Self;
+    fn write(self, out: &mut [u8]);
+}
+
+macro_rules! numeric_host_element {
+    ($($ty:ty),*) => {$(
+        impl HostElement for $ty {
+            const SIZE: usize = std::mem::size_of::<$ty>();
+            fn read(bytes: &[u8]) -> Self {
+                <$ty>::from_ne_bytes(bytes.try_into().expect("element width"))
+            }
+            fn write(self, out: &mut [u8]) {
+                out.copy_from_slice(&self.to_ne_bytes());
+            }
+        }
+    )*};
+}
+numeric_host_element!(f32, f64, i32, i64);
+
+impl HostElement for bool {
+    const SIZE: usize = 1;
+    fn read(bytes: &[u8]) -> Self {
+        bytes[0] != 0
+    }
+    fn write(self, out: &mut [u8]) {
+        out[0] = u8::from(self);
+    }
+}
+
+// Julia's `Complex{T}` and `num_complex::Complex<T>` both store `re` then `im`.
+impl<T: HostElement> HostElement for num_complex::Complex<T> {
+    const SIZE: usize = 2 * T::SIZE;
+    fn read(bytes: &[u8]) -> Self {
+        num_complex::Complex::new(T::read(&bytes[..T::SIZE]), T::read(&bytes[T::SIZE..]))
+    }
+    fn write(self, out: &mut [u8]) {
+        let (re, im) = out.split_at_mut(T::SIZE);
+        self.re.write(re);
+        self.im.write(im);
+    }
+}
+
+fn element_count(shape: &[usize]) -> FfiResult<usize> {
+    Ok(shape
         .iter()
         .try_fold(1usize, |n, d| n.checked_mul(*d))
-        .ok_or("shape overflow")?;
+        .ok_or("shape overflow")?)
+}
+
+fn decode<T: HostElement>(bytes: &[u8], len: usize) -> FfiResult<Vec<T>> {
+    if len.checked_mul(T::SIZE) != Some(bytes.len()) {
+        return Err("input buffer does not match the tensor shape".into());
+    }
+    Ok(bytes.chunks_exact(T::SIZE).map(T::read).collect())
+}
+
+fn encode<T: HostElement>(values: &[T], out: &mut [u8]) -> FfiResult<()> {
+    if values.len().checked_mul(T::SIZE) != Some(out.len()) {
+        return Err("shape mismatch".into());
+    }
+    for (value, bytes) in values.iter().zip(out.chunks_exact_mut(T::SIZE)) {
+        value.write(bytes);
+    }
+    Ok(())
+}
+
+fn input_tensor(data: &[u8], shape: &[usize], kind: i32) -> FfiResult<Tensor> {
+    let len = element_count(shape)?;
+    let dims = shape.to_vec();
     macro_rules! make {
-        ($ty:ty) => {{
-            let values = if len == 0 {
-                vec![]
-            } else {
-                std::slice::from_raw_parts(data.cast::<$ty>(), len).to_vec()
-            };
-            Tensor::from_vec_col_major(dims, values)?
-        }};
+        ($ty:ty) => {
+            Tensor::from_vec_col_major(dims, decode::<$ty>(data, len)?)?
+        };
     }
     Ok(match kind {
         0 => make!(f32),
@@ -52,17 +107,11 @@ unsafe fn input_tensor(
     })
 }
 
-unsafe fn copy_tensor(value: &Tensor, out: *mut u8, len: usize, kind: i32) -> FfiResult<()> {
+fn copy_tensor(value: &Tensor, out: &mut [u8], kind: i32) -> FfiResult<()> {
     macro_rules! copy {
-        ($ty:ty) => {{
-            let values = value.as_slice::<$ty>()?;
-            if values.len() != len {
-                return Err("shape mismatch".into());
-            }
-            if len > 0 {
-                std::ptr::copy_nonoverlapping(values.as_ptr(), out.cast::<$ty>(), len);
-            }
-        }};
+        ($ty:ty) => {
+            encode(value.as_slice::<$ty>()?, out)
+        };
     }
     match kind {
         0 => copy!(f32),
@@ -72,9 +121,8 @@ unsafe fn copy_tensor(value: &Tensor, out: *mut u8, len: usize, kind: i32) -> Ff
         6 => copy!(bool),
         4 => copy!(num_complex::Complex32),
         5 => copy!(num_complex::Complex64),
-        _ => return Err("unsupported element type".into()),
+        _ => Err("unsupported element type".into()),
     }
-    Ok(())
 }
 
 #[julia]
@@ -112,13 +160,12 @@ impl EagerGraph {
     #[julia]
     pub fn input_array(
         &mut self,
-        data: *const u8,
-        shape: *const usize,
-        rank: usize,
+        data: &[u8],
+        shape: &[usize],
         kind: i32,
     ) -> Result<i64, String> {
         let result = (|| {
-            let tensor = unsafe { input_tensor(data, shape, rank, kind)? };
+            let tensor = input_tensor(data, shape, kind)?;
             let ctx = self
                 .ctx
                 .as_ref()
@@ -138,8 +185,7 @@ impl EagerGraph {
     pub fn copy_array(
         &self,
         node: usize,
-        out: *mut u8,
-        len: usize,
+        out: &mut [u8],
         kind: i32,
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
@@ -148,10 +194,7 @@ impl EagerGraph {
                 .get(node)
                 .ok_or("invalid node")?
                 .to_tensor(&mut tenferro_cpu::CpuEngine::serial())?;
-            unsafe {
-                copy_tensor(&value, out, len, kind)?;
-            }
-            Ok(())
+            copy_tensor(&value, out, kind)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
     }
@@ -271,17 +314,11 @@ impl EagerGraph {
     #[julia]
     pub fn concatenate(
         &mut self,
-        data: *const usize,
-        len: usize,
+        ids: &[usize],
         axis: usize,
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
-            let ids = if len == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(data, len) }
-            };
             let inputs: Vec<&EagerTensor> = ids
                 .iter()
                 .map(|id| self.nodes.get(*id).ok_or("invalid input"))
@@ -418,21 +455,19 @@ impl EagerGraph {
     pub fn slice_node(
         &mut self,
         input: usize,
-        data: *const usize,
-        rank: usize,
+        bounds: &[usize],
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let values = if rank == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(data, 3 * rank) }
-            };
+            let rank = x.shape().len();
+            if bounds.len() != 3 * rank {
+                return Err("slice bounds must contain starts, limits and strides".into());
+            }
             let config = tenferro_ad::SliceConfig {
-                starts: values[..rank].to_vec(),
-                limits: values[rank..2 * rank].to_vec(),
-                strides: values[2 * rank..].to_vec(),
+                starts: bounds[..rank].to_vec(),
+                limits: bounds[rank..2 * rank].to_vec(),
+                strides: bounds[2 * rank..].to_vec(),
             };
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
@@ -448,17 +483,11 @@ impl EagerGraph {
     pub fn broadcast_to(
         &mut self,
         input: usize,
-        shape: *const usize,
-        rank: usize,
+        shape: &[usize],
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let shape = if rank == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(shape, rank) }
-            };
             let dims: Vec<usize> = (0..x.shape().len()).collect();
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
@@ -474,18 +503,12 @@ impl EagerGraph {
     pub fn shape_op(
         &mut self,
         input: usize,
-        values: *const usize,
-        len: usize,
+        args: &[usize],
         op: i32,
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let args = if len == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(values, len) }
-            };
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
                     0 => s.reshape(x, args),
@@ -601,14 +624,13 @@ impl TracedGraph {
     #[julia]
     pub fn traced_input_array(
         &mut self,
-        data: *const u8,
-        shape: *const usize,
-        rank: usize,
+        data: &[u8],
+        shape: &[usize],
         kind: i32,
     ) -> Result<i64, String> {
         let result = (|| {
             Ok(tenferro_runtime::TracedTensor::from_tensor_concrete_shape(
-                unsafe { input_tensor(data, shape, rank, kind)? },
+                input_tensor(data, shape, kind)?,
             )?)
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
@@ -619,8 +641,7 @@ impl TracedGraph {
     pub fn traced_copy_array(
         &self,
         node: usize,
-        out: *mut u8,
-        len: usize,
+        out: &mut [u8],
         kind: i32,
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
@@ -643,7 +664,7 @@ impl TracedGraph {
                 .pop()
                 .ok_or("missing output")?
                 .into_tensor(&mut engine)?;
-            unsafe { copy_tensor(&value, out, len, kind) }
+            copy_tensor(&value, out, kind)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
     }
@@ -704,16 +725,10 @@ impl TracedGraph {
     #[julia]
     pub fn traced_concatenate(
         &mut self,
-        data: *const usize,
-        len: usize,
+        ids: &[usize],
         axis: usize,
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
-            let ids = if len == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(data, len) }
-            };
             let inputs: Vec<&tenferro_runtime::TracedTensor> = ids
                 .iter()
                 .map(|id| self.nodes.get(*id).ok_or("invalid input"))
@@ -832,20 +847,18 @@ impl TracedGraph {
     pub fn traced_slice_node(
         &mut self,
         input: usize,
-        data: *const usize,
-        rank: usize,
+        bounds: &[usize],
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let values = if rank == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(data, 3 * rank) }
-            };
+            let rank = x.rank;
+            if bounds.len() != 3 * rank {
+                return Err("slice bounds must contain starts, limits and strides".into());
+            }
             let config = tenferro_runtime::SliceConfig {
-                starts: values[..rank].to_vec(),
-                limits: values[rank..2 * rank].to_vec(),
-                strides: values[2 * rank..].to_vec(),
+                starts: bounds[..rank].to_vec(),
+                limits: bounds[rank..2 * rank].to_vec(),
+                strides: bounds[2 * rank..].to_vec(),
             };
             Ok(x.slice(config)?)
         })();
@@ -857,16 +870,10 @@ impl TracedGraph {
     pub fn traced_broadcast_to(
         &mut self,
         input: usize,
-        shape: *const usize,
-        rank: usize,
+        shape: &[usize],
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let shape = if rank == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(shape, rank) }
-            };
             let dims: Vec<usize> = (0..x.rank).collect();
             Ok(x.broadcast_in_dim(shape, &dims)?)
         })();
@@ -878,17 +885,11 @@ impl TracedGraph {
     pub fn traced_shape_op(
         &mut self,
         input: usize,
-        values: *const usize,
-        len: usize,
+        args: &[usize],
         op: i32,
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let args = if len == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(values, len) }
-            };
             Ok(match op {
                 0 => x.reshape(args)?,
                 1 => x.transpose(args)?,
@@ -1047,99 +1048,25 @@ pub struct TypedStorage {
 #[julia]
 impl TypedStorage {
     #[julia]
-    pub fn new(
-        data: *const u8,
-        shape: *const usize,
-        rank: usize,
-        kind: i32,
-    ) -> Result<Self, String> {
-        let result = (|| -> Result<TypedData, Box<dyn std::error::Error>> {
-            let dims = if rank == 0 {
-                vec![]
-            } else {
-                unsafe { std::slice::from_raw_parts(shape, rank) }.to_vec()
-            };
-            let len = dims
-                .iter()
-                .try_fold(1usize, |n, d| n.checked_mul(*d))
-                .ok_or("shape overflow")?;
+    pub fn new(data: &[u8], shape: &[usize], kind: i32) -> Result<Self, String> {
+        let result = (|| -> FfiResult<TypedData> {
+            let len = element_count(shape)?;
+            macro_rules! make {
+                ($variant:ident) => {
+                    TypedData::$variant(tenferro_tensor::TypedTensor::from_host_vec_col_major(
+                        shape.to_vec(),
+                        decode(data, len)?,
+                    )?)
+                };
+            }
             Ok(match kind {
-                0 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(data.cast::<f32>(), len) }.to_vec()
-                    };
-                    TypedData::F32(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                1 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(data.cast::<f64>(), len) }.to_vec()
-                    };
-                    TypedData::F64(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                2 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(data.cast::<i32>(), len) }.to_vec()
-                    };
-                    TypedData::I32(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                3 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(data.cast::<i64>(), len) }.to_vec()
-                    };
-                    TypedData::I64(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                4 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe {
-                            std::slice::from_raw_parts(data.cast::<num_complex::Complex32>(), len)
-                        }
-                        .to_vec()
-                    };
-                    TypedData::C32(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                5 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe {
-                            std::slice::from_raw_parts(data.cast::<num_complex::Complex64>(), len)
-                        }
-                        .to_vec()
-                    };
-                    TypedData::C64(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
-                6 => {
-                    let values = if len == 0 {
-                        vec![]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(data.cast::<bool>(), len) }.to_vec()
-                    };
-                    TypedData::Bool(tenferro_tensor::TypedTensor::from_host_vec_col_major(
-                        dims, values,
-                    )?)
-                }
+                0 => make!(F32),
+                1 => make!(F64),
+                2 => make!(I32),
+                3 => make!(I64),
+                4 => make!(C32),
+                5 => make!(C64),
+                6 => make!(Bool),
                 _ => return Err("unsupported element type".into()),
             })
         })();
@@ -1148,48 +1075,26 @@ impl TypedStorage {
             .map_err(|err| err.to_string())
     }
     #[julia]
-    pub fn typed_copy(&self, out: *mut u8, len: usize) -> i32 {
-        typed_match!(&self.data, |t| {
-            let slice = t.as_slice();
-            if slice.len() != len {
-                1
-            } else {
-                if len > 0 {
-                    unsafe { std::ptr::copy_nonoverlapping(slice.as_ptr(), out.cast(), len) };
-                }
-                0
-            }
-        })
+    pub fn typed_copy(&self, out: &mut [u8]) -> i32 {
+        typed_match!(&self.data, |t| i32::from(encode(t.as_slice(), out).is_err()))
     }
     #[julia]
-    pub fn typed_get(&self, index: usize, out: *mut u8) -> i32 {
+    pub fn typed_get(&self, index: usize, out: &mut [u8]) -> i32 {
         typed_match!(&self.data, |t| match t.as_slice().get(index) {
-            Some(v) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        std::ptr::from_ref(v).cast::<u8>(),
-                        out,
-                        std::mem::size_of_val(v),
-                    )
-                };
-                0
-            }
+            Some(v) => i32::from(encode(std::slice::from_ref(v), out).is_err()),
             None => 1,
         })
     }
     #[julia]
-    pub fn typed_set(&mut self, index: usize, value: *const u8) -> i32 {
+    pub fn typed_set(&mut self, index: usize, value: &[u8]) -> i32 {
         typed_match!(&mut self.data, |t| match t.host_data_mut().get_mut(index) {
-            Some(v) => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        value,
-                        std::ptr::from_mut(&mut *v).cast::<u8>(),
-                        std::mem::size_of_val(v),
-                    )
-                };
-                0
-            }
+            Some(v) => match decode(value, 1) {
+                Ok(decoded) => {
+                    *v = decoded[0];
+                    0
+                }
+                Err(_) => 1,
+            },
             None => 1,
         })
     }

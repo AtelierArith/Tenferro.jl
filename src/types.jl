@@ -33,9 +33,7 @@ const ADElement = Union{Float32,Float64,ComplexF32,ComplexF64}
 const TensorElement = Union{ADElement,Int32,Int64,Bool}
 
 function EagerTensor(ctx::EagerContext, x::AbstractArray{T,N}) where {T<:TensorElement,N}
-    id = _with_input_buffer(x) do data, shape, rank
-        RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.input_array, data, shape, rank, _typed_kind(T)))
-    end
+    id = RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.input_array, _bytes(x), _dims(x), _typed_kind(T)))
     id >= 0 || error("tenferro-rs could not create the input tensor")
     return EagerTensor{T,N,typeof(ctx.graph)}(ctx.graph, id, size(x))
 end
@@ -65,9 +63,7 @@ struct TracedTensor{T,N,G}
 end
 
 function TracedTensor(ctx::TracedContext, x::AbstractArray{T,N}) where {T<:TensorElement,N}
-    id = _with_input_buffer(x) do data, shape, rank
-        RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_input_array, data, shape, rank, _typed_kind(T)))
-    end
+    id = RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_input_array, _bytes(x), _dims(x), _typed_kind(T)))
     id >= 0 || error("tenferro-rs could not create the traced input")
     return TracedTensor{T,N,typeof(ctx.graph)}(ctx.graph, id, size(x))
 end
@@ -99,9 +95,7 @@ _typed_kind(::Type{Bool}) = Int32(6)
 
 function TypedTensor(x::AbstractArray{T,N}) where {T<:TypedElement,N}
     dims = size(x)
-    storage = _with_input_buffer(x) do data, shape, rank
-        _RustState(RustCall.result_to_exception(RustCrate.TypedStorage(data, shape, rank, _typed_kind(T))))
-    end
+    storage = _RustState(RustCall.result_to_exception(RustCrate.TypedStorage(_bytes(x), _dims(x), _typed_kind(T))))
     return TypedTensor{T,N,typeof(storage)}(storage, dims)
 end
 TypedTensor(x::AbstractArray) = throw(ArgumentError("unsupported TypedTensor element type: $(eltype(x))"))
