@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "9e7082c22281df7439de84f5ed88f284da48364b"
+project_hash = "14b7590880b5b9efad3cefa5e662811ffe7eec1b"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -633,10 +633,10 @@ weakdeps = ["Distributed"]
 
 [[deps.RustCall]]
 deps = ["Dates", "FileWatching", "Libdl", "RustToolChain", "SHA", "Scratch", "TOML"]
-git-tree-sha1 = "6f25ce8eadd42e92233be7645bd067c710c88330"
+git-tree-sha1 = "6c3b55d8ec3d8ab1c6f81fb98b4b42c2885a1e59"
 registries = "General"
 uuid = "7ac5b1a4-9e37-4f0e-9aa3-3305a66bfb1c"
-version = "0.9.2"
+version = "0.10.0"
 
     [deps.RustCall.extensions]
     RustCallPyO3HostExt = "PythonCall"

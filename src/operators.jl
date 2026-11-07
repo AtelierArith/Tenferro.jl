@@ -1,9 +1,7 @@
 function Base.Array(x::EagerTensor{T}) where {T}
-    out = Array{T}(undef, x.dims)
-    _with_output_buffer(out) do data, len
-        RustCall.result_to_exception(_rust_call(x.graph, RustCrate.copy_array, UInt(x.id), data, len, _typed_kind(T)))
+    return _read_array(T, x.dims) do out
+        RustCall.result_to_exception(_rust_call(x.graph, RustCrate.copy_array, UInt(x.id), out, _typed_kind(T)))
     end
-    return out
 end
 
 for (op, code) in ((:+, 0), (:-, 1))
@@ -33,11 +31,9 @@ function Base.sum(a::EagerTensor{T}; dims=:) where {T}
 end
 
 function Base.Array(x::TracedTensor{T}) where {T}
-    out = Array{T}(undef, x.dims)
-    _with_output_buffer(out) do data, len
-        RustCall.result_to_exception(_rust_call(x.graph, RustCrate.traced_copy_array, UInt(x.id), data, len, _typed_kind(T)))
+    return _read_array(T, x.dims) do out
+        RustCall.result_to_exception(_rust_call(x.graph, RustCrate.traced_copy_array, UInt(x.id), out, _typed_kind(T)))
     end
-    return out
 end
 
 for (op, code) in ((:+, 0), (:-, 1))
@@ -71,28 +67,23 @@ Base.IndexStyle(::Type{<:TypedTensor}) = IndexLinear()
 Base.similar(::TypedTensor, ::Type{T}, dims::Dims) where {T} = Array{T}(undef, dims)
 
 function Base.Array(x::TypedTensor{T,N}) where {T,N}
-    out = Array{T}(undef, x.dims)
-    _with_output_buffer(out) do data, len
-        _rust_call(x.storage, RustCrate.typed_copy, data, len) == 0 || error("tenferro-rs could not read typed tensor")
+    return _read_array(T, x.dims) do out
+        _rust_call(x.storage, RustCrate.typed_copy, out) == 0 || error("tenferro-rs could not read typed tensor")
     end
-    return out
 end
 
 function Base.getindex(x::TypedTensor{T}, i::Int) where {T}
     @boundscheck checkbounds(x, i)
-    out = Ref{T}()
-    _with_scalar_buffer(out) do data
-        _rust_call(x.storage, RustCrate.typed_get, UInt(i - 1), data) == 0 || throw(BoundsError(x, i))
+    out = _read_array(T, 1) do bytes
+        _rust_call(x.storage, RustCrate.typed_get, UInt(i - 1), bytes) == 0 || throw(BoundsError(x, i))
     end
-    return out[]
+    return out[1]
 end
 
 function Base.setindex!(x::TypedTensor{T}, value, i::Int) where {T}
     @boundscheck checkbounds(x, i)
-    data = Ref{T}(convert(T, value))
-    _with_scalar_buffer(data) do ptr
-        _rust_call(x.storage, RustCrate.typed_set, UInt(i - 1), ptr) == 0 || throw(BoundsError(x, i))
-    end
+    bytes = _bytes(T[convert(T, value)])
+    _rust_call(x.storage, RustCrate.typed_set, UInt(i - 1), bytes) == 0 || throw(BoundsError(x, i))
     return x
 end
 
@@ -118,13 +109,13 @@ Base.conj(a::_ADTensor) = _unary(conj, a)
 function _broadcast_to(a::EagerTensor{T}, dims) where {T}
     a.dims == dims && return a
     values = UInt[dims...]
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.broadcast_to, UInt(a.id), pointer(values), UInt(length(values))))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.broadcast_to, UInt(a.id), values))
     EagerTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function _broadcast_to(a::TracedTensor{T}, dims) where {T}
     a.dims == dims && return a
     values = UInt[dims...]
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_broadcast_to, UInt(a.id), pointer(values), UInt(length(values))))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_broadcast_to, UInt(a.id), values))
     TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function _convert_tensor(a::EagerTensor{T,N}, ::Type{S}) where {T,N,S<:ADElement}
@@ -197,12 +188,12 @@ end
 
 function _shape_op(a::EagerTensor{T}, args, op, dims) where {T}
     values = UInt[args...]
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.shape_op, UInt(a.id), pointer(values), UInt(length(values)), Int32(op)))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.shape_op, UInt(a.id), values, Int32(op)))
     EagerTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function _shape_op(a::TracedTensor{T}, args, op, dims) where {T}
     values = UInt[args...]
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_shape_op, UInt(a.id), pointer(values), UInt(length(values)), Int32(op)))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_shape_op, UInt(a.id), values, Int32(op)))
     TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function Base.reshape(a::_ADTensor, dims::Tuple{Vararg{Int}})
@@ -289,11 +280,11 @@ function Base.Broadcast.broadcasted(::typeof(abs), a::TracedTensor{T,N}) where {
 end
 
 function _slice(a::EagerTensor{T}, values, dims) where {T}
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.slice_node, UInt(a.id), pointer(values), UInt(length(a.dims))))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.slice_node, UInt(a.id), values))
     EagerTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function _slice(a::TracedTensor{T}, values, dims) where {T}
-    id = GC.@preserve values RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_slice_node, UInt(a.id), pointer(values), UInt(length(a.dims))))
+    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_slice_node, UInt(a.id), values))
     TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
 function _slice_index(a::_ADTensor, indices::Union{Integer,AbstractRange{<:Integer},Colon}...)
@@ -389,7 +380,7 @@ function _cat(first::_ADTensor, rest, dims)
     shape = ntuple(i -> i == dims ? sum(a -> a.dims[i], inputs) : first.dims[i], length(first.dims))
     ids = UInt[a.id for a in inputs]
     fn = first isa EagerTensor ? RustCrate.concatenate : RustCrate.traced_concatenate
-    id = GC.@preserve ids RustCall.result_to_exception(_rust_call(first.graph, fn, pointer(ids), UInt(length(ids)), UInt(dims - 1)))
+    id = RustCall.result_to_exception(_rust_call(first.graph, fn, ids, UInt(dims - 1)))
     _factor_tensor(first, promoted, id, shape)
 end
 Base.cat(first::_ADTensor, rest::_ADTensor...; dims) = _cat(first, rest, dims)

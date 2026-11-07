@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustcall_julia_macros = "0.6"
+rustcall_julia_macros = "0.7"
 tenferro-ad = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-ad" }
 tenferro-linalg = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-linalg", features = ["autodiff"] }
 tenferro-cpu = { version = "0.9.0", path = "../../extern/tenferro-rs/crates/tenferro-cpu" }

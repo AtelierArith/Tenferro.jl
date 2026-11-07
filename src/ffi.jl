@@ -1,24 +1,17 @@
-# Raw pointers passed to Rust are valid only for the duration of each callback.
-# RustCall supplies a contiguous copy, including for views and empty inputs.
-function _with_input_buffer(f, x::AbstractArray)
-    shape = UInt[size(x)...]
-    RustCall.with_numeric_buffer(x) do data, _
-        RustCall.with_numeric_buffer(shape) do dims, rank
-            f(Ptr{UInt8}(data), dims, rank)
-        end
-    end
-end
+# RustCall borrows these vectors as checked `&[T]` / `&mut [T]` slices for the
+# duration of one synchronous call; Rust copies anything it keeps.
+_dense_vector(x::Array) = vec(x)
+_dense_vector(x::AbstractArray) = vec(Array(x))
 
-function _with_output_buffer(f, out::Array)
-    GC.@preserve out begin
-        return f(Ptr{UInt8}(pointer(out)), UInt(length(out)))
-    end
-end
+# Tensor payloads cross the boundary as native-endian bytes tagged by `_typed_kind`.
+_bytes(x::AbstractArray) = reinterpret(UInt8, _dense_vector(x))
+_dims(x::AbstractArray) = UInt[size(x)...]
 
-function _with_scalar_buffer(f, value::Ref{T}) where {T}
-    GC.@preserve value begin
-        return f(Ptr{UInt8}(Base.unsafe_convert(Ptr{T}, value)))
-    end
+# Mutable slices must be initialized before they are borrowed.
+function _read_array(f, ::Type{T}, dims) where {T}
+    out = zeros(T, dims)
+    f(_bytes(out))
+    return out
 end
 
 # RustCall exposes mutable Rust objects; serialize all accesses to each object.

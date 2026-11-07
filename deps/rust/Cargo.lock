@@ -665,9 +665,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rustcall_julia_core"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c717cc8751b2e0eff0e2414bc79785f91ce11cba08a05134da97d9bd4a7950"
+checksum = "b617c361b25a456be2518f2b54df1760bf8611d0717b7e3926d9527ee4163910"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -675,22 +675,23 @@ dependencies = [
  "serde",
  "syn 2.0.119",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "rustcall_julia_macros"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b0626118634c9ed649016eeba705cc9bd817e10819430d28df6c47f6fe0b337"
+checksum = "50dc0e26b0aacbd223fa9679faa83d29a9a889372659c4b448c831d98cfb8f42"
 dependencies = [
  "rustcall_julia_macros_impl",
 ]
 
 [[package]]
 name = "rustcall_julia_macros_impl"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c01c2ea9f11b49a3cb6159c2c4d53c22fe6697a817e89433723a70a717426265"
+checksum = "6a698dfa330e8f167d9371893098c741a62b564c41c2a8be1f55fa09b8a50507"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1494,6 +1495,15 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "valuable"
