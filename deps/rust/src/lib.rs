@@ -611,6 +611,7 @@ impl EagerGraph {
 
 #[julia]
 pub struct TracedGraph {
+    trace: tenferro_runtime::TraceContext,
     nodes: Vec<tenferro_runtime::TracedTensor>,
 }
 
@@ -618,7 +619,10 @@ pub struct TracedGraph {
 impl TracedGraph {
     #[julia]
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            trace: tenferro_runtime::TraceContext::new(),
+            nodes: Vec::new(),
+        }
     }
 
     #[julia]
@@ -629,7 +633,7 @@ impl TracedGraph {
         kind: i32,
     ) -> Result<i64, String> {
         let result = (|| {
-            Ok(tenferro_runtime::TracedTensor::from_tensor_concrete_shape(
+            Ok(self.trace.from_tensor_concrete_shape(
                 input_tensor(data, shape, kind)?,
             )?)
         })();
@@ -851,7 +855,7 @@ impl TracedGraph {
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let rank = x.rank;
+            let rank = x.rank();
             if bounds.len() != 3 * rank {
                 return Err("slice bounds must contain starts, limits and strides".into());
             }
@@ -874,7 +878,7 @@ impl TracedGraph {
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let dims: Vec<usize> = (0..x.rank).collect();
+            let dims: Vec<usize> = (0..x.rank()).collect();
             Ok(x.broadcast_in_dim(shape, &dims)?)
         })();
         let value = result.map_err(|err| err.to_string())?;
