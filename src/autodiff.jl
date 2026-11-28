@@ -117,6 +117,14 @@ function _gradient(backend::_Backend, f::F, x, contexts, want_value::Bool) where
     _record(backend, f, x, contexts) do ctx, inputs, output
         _is_scalar(output) || throw(ArgumentError("gradient requires a scalar output"))
         seed = _seed(ctx, fill(one(eltype(output))))
+        if want_value && ctx isa TracedContext && eltype(output) <: Real
+            # The value as the gradient of `output * s` at `s = 1`: it comes out of the
+            # derivative program, which computes the forward pass anyway, instead of a
+            # second copy of the forward pass compiled next to it.
+            s = TracedTensor(ctx, fill(one(eltype(output))))
+            grads, value = _reverse(ctx, Base.Broadcast.broadcasted(*, output, s), (inputs, s), seed, false)
+            return value[], grads
+        end
         grads = _reverse(ctx, output, inputs, seed, want_value)
         return (want_value ? _value(output) : nothing), grads
     end

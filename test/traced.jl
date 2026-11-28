@@ -52,3 +52,17 @@ end
     @test only(pushforward(sum, backend, Float64[], (Float64[],))) == 0.0
     @test only(pullback(sum, backend, Float64[], (1.0,))) == Float64[]
 end
+
+@testset "traced value_and_gradient computes the value in the derivative program" begin
+    backend = AutoTenferroTraced()
+    x = Float32[1.5, -2.0, 3.25]
+    value, grad = value_and_gradient(a -> sum(a .* a), backend, x)
+    @test value === sum(x .* x) && grad == 2 .* x
+    # An output that does not depend on the input, and non-finite values.
+    @test value_and_gradient(a -> sum(a .* 0) + 7.0f0, backend, x) == (7.0f0, zeros(Float32, 3))
+    @test first(value_and_gradient(a -> sum(a ./ 0), backend, [1.0, 2.0])) == Inf
+    # Complex outputs keep the separate value (the gradient convention conjugates).
+    z = [1.0 + 2.0im, -0.5im]
+    value, grad = value_and_gradient(a -> sum(a .* a), backend, z)
+    @test value ≈ sum(z .* z) && grad ≈ value_and_gradient(a -> sum(a .* a), AutoTenferro(), z)[2]
+end
