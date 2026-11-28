@@ -153,6 +153,36 @@ fn gather_axis_config(shape: &[usize], axis: usize) -> FfiResult<tenferro_ad::Ga
     })
 }
 
+/// Decode `[low..., high..., interior...]` padding amounts for a rank-`rank` tensor.
+fn pad_config(rank: usize, amounts: &[i64]) -> FfiResult<tenferro_ad::PadConfig> {
+    if amounts.len() != 3 * rank {
+        return Err("padding must contain low, high and interior amounts".into());
+    }
+    Ok(tenferro_ad::PadConfig {
+        edge_padding_low: amounts[..rank].to_vec(),
+        edge_padding_high: amounts[rank..2 * rank].to_vec(),
+        interior_padding: amounts[2 * rank..].to_vec(),
+    })
+}
+
+/// Decode `[n_contract, n_batch, lhs_contract..., rhs_contract..., lhs_batch..., rhs_batch...]`.
+fn dot_general_config(dims: &[usize]) -> FfiResult<tenferro_ad::DotGeneralConfig> {
+    let (nc, nb) = match dims {
+        [nc, nb, ..] => (*nc, *nb),
+        _ => return Err("missing dot_general dimension counts".into()),
+    };
+    if dims.len() != 2 + 2 * nc + 2 * nb {
+        return Err("dot_general dimension numbers have the wrong length".into());
+    }
+    let rest = &dims[2..];
+    Ok(tenferro_ad::DotGeneralConfig {
+        lhs_contracting_dims: rest[..nc].into(),
+        rhs_contracting_dims: rest[nc..2 * nc].into(),
+        lhs_batch_dims: rest[2 * nc..2 * nc + nb].into(),
+        rhs_batch_dims: rest[2 * nc + nb..].into(),
+    })
+}
+
 #[julia]
 pub struct EagerGraph {
     ctx: Option<std::sync::Arc<EagerRuntime>>,
@@ -673,6 +703,74 @@ impl EagerGraph {
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
         Ok(self.push(value))
     }
+
+    #[julia]
+    pub fn activation(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                    0 => s.sigmoid(x),
+                    1 => s.silu(x),
+                    2 => s.softplus(x),
+                    3 => s.gelu(x),
+                    4 => s.gelu_tanh(x),
+                    _ => unreachable!(),
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn softmax_node(&mut self, input: usize, axis: usize, log: bool) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    if log {
+                        s.log_softmax(x, axis as isize)
+                    } else {
+                        s.softmax(x, axis as isize)
+                    }
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn pad_node(&mut self, input: usize, amounts: &[i64]) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            let config = pad_config(x.shape().len(), amounts)?;
+            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| s.pad(x, config))?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn dot_general_node(&mut self, lhs: usize, rhs: usize, dims: &[usize]) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            let config = dot_general_config(dims)?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.dot_general(a, b, config)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
 }
 
 impl EagerGraph {
@@ -1053,6 +1151,63 @@ impl TracedGraph {
                 .reduce_sum(None)?)
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_activation(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(match op {
+                0 => x.sigmoid()?,
+                1 => x.silu()?,
+                2 => x.softplus()?,
+                3 => x.gelu()?,
+                4 => x.gelu_tanh()?,
+                _ => unreachable!(),
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_softmax_node(&mut self, input: usize, axis: usize, log: bool) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(if log {
+                x.log_softmax(axis as isize)?
+            } else {
+                x.softmax(axis as isize)?
+            })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_pad_node(&mut self, input: usize, amounts: &[i64]) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(x.pad(pad_config(x.rank(), amounts)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_dot_general_node(
+        &mut self,
+        lhs: usize,
+        rhs: usize,
+        dims: &[usize],
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            Ok(a.dot_general(b, dot_general_config(dims)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
     }
 

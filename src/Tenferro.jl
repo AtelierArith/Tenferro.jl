@@ -17,6 +17,7 @@ include("ffi.jl")
 include("types.jl")
 include("operators.jl")
 include("interface.jl")
+include("nnops.jl")
 include("autodiff.jl")
 
 end
