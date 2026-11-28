@@ -1,10 +1,18 @@
+mod alloc;
+mod dense_extension;
 mod engine;
 mod kernels;
 mod rem_extension;
 mod relu_extension;
 mod window_extension;
+mod xent_extension;
 
 use rustcall_julia_macros::julia;
+
+/// Large blocks freed by one step are reused by the next (see `alloc`).
+#[global_allocator]
+static ALLOCATOR: alloc::CachingAlloc = alloc::CachingAlloc;
+
 use tenferro_ad::{EagerRuntime, EagerSession, EagerTensor, Tensor};
 
 /// Run `f` in an eager session of `ctx` on the shared CPU engine.
@@ -20,6 +28,16 @@ fn eager_session<T, E: From<tenferro_ad::Error>>(
 pub fn set_num_threads(threads: usize) -> usize {
     engine::set_threads(threads);
     engine::engine_threads()
+}
+
+/// Run the dense kernels' GEMMs on the ILP64 Fortran `sgemm`/`dgemm` at these addresses
+/// (Julia passes libblastrampoline's `sgemm_64_`/`dgemm_64_`; 0 selects the built-in GEMM).
+/// Returns 1 when a BLAS `sgemm` was registered before the call, else 0.
+#[julia]
+pub fn set_blas_gemm(sgemm: usize, dgemm: usize) -> i32 {
+    // SAFETY: Julia passes libblastrampoline's entry points, which have the Fortran ILP64
+    // `?gemm` signature and live as long as the process, or 0.
+    i32::from(unsafe { kernels::set_blas_gemm(sgemm, dgemm) })
 }
 
 /// The number of CPU worker threads tenferro-rs kernels run on.
@@ -46,6 +64,9 @@ fn float_dtype(kind: i32) -> FfiResult<tenferro_ad::DType> {
 /// the length and never reinterprets bytes as a typed reference.
 trait HostElement: Copy {
     const SIZE: usize;
+    /// Every bit pattern of `SIZE` bytes is a valid value, so whole buffers can be copied
+    /// as bytes.
+    const PLAIN: bool;
     fn read(bytes: &[u8]) -> Self;
     fn write(self, out: &mut [u8]);
 }
@@ -54,6 +75,7 @@ macro_rules! numeric_host_element {
     ($($ty:ty),*) => {$(
         impl HostElement for $ty {
             const SIZE: usize = std::mem::size_of::<$ty>();
+            const PLAIN: bool = true;
             fn read(bytes: &[u8]) -> Self {
                 <$ty>::from_ne_bytes(bytes.try_into().expect("element width"))
             }
@@ -67,6 +89,7 @@ numeric_host_element!(f32, f64, i32, i64);
 
 impl HostElement for bool {
     const SIZE: usize = 1;
+    const PLAIN: bool = false;
     fn read(bytes: &[u8]) -> Self {
         bytes[0] != 0
     }
@@ -78,6 +101,7 @@ impl HostElement for bool {
 // Julia's `Complex{T}` and `num_complex::Complex<T>` both store `re` then `im`.
 impl<T: HostElement> HostElement for num_complex::Complex<T> {
     const SIZE: usize = 2 * T::SIZE;
+    const PLAIN: bool = T::PLAIN;
     fn read(bytes: &[u8]) -> Self {
         num_complex::Complex::new(T::read(&bytes[..T::SIZE]), T::read(&bytes[T::SIZE..]))
     }
@@ -99,12 +123,29 @@ fn decode<T: HostElement>(bytes: &[u8], len: usize) -> FfiResult<Vec<T>> {
     if len.checked_mul(T::SIZE) != Some(bytes.len()) {
         return Err("input buffer does not match the tensor shape".into());
     }
+    if T::PLAIN && std::mem::size_of::<T>() == T::SIZE {
+        let mut values = Vec::<T>::with_capacity(len);
+        // SAFETY: `values` has room for `len` elements, i.e. `bytes.len()` bytes; every bit
+        // pattern is a valid `T` (`PLAIN`), and the source is read as bytes, so its
+        // alignment does not matter.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), values.as_mut_ptr().cast::<u8>(), bytes.len());
+            values.set_len(len);
+        }
+        return Ok(values);
+    }
     Ok(bytes.chunks_exact(T::SIZE).map(T::read).collect())
 }
 
 fn encode<T: HostElement>(values: &[T], out: &mut [u8]) -> FfiResult<()> {
     if values.len().checked_mul(T::SIZE) != Some(out.len()) {
         return Err("shape mismatch".into());
+    }
+    if T::PLAIN && std::mem::size_of::<T>() == T::SIZE {
+        // SAFETY: `values` spans exactly `out.len()` bytes of plain values.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), out.len()) };
+        out.copy_from_slice(bytes);
+        return Ok(());
     }
     for (value, bytes) in values.iter().zip(out.chunks_exact_mut(T::SIZE)) {
         value.write(bytes);
@@ -133,6 +174,26 @@ fn input_tensor(data: &[u8], shape: &[usize], kind: i32) -> FfiResult<Tensor> {
 }
 
 fn copy_tensor(value: &Tensor, out: &mut [u8], kind: i32) -> FfiResult<()> {
+    macro_rules! copy {
+        ($ty:ty) => {
+            encode(value.as_slice::<$ty>()?, out)
+        };
+    }
+    match kind {
+        0 => copy!(f32),
+        1 => copy!(f64),
+        2 => copy!(i32),
+        3 => copy!(i64),
+        6 => copy!(bool),
+        4 => copy!(num_complex::Complex32),
+        5 => copy!(num_complex::Complex64),
+        _ => Err("unsupported element type".into()),
+    }
+}
+
+/// Copy a compact host value into `out` without an intermediate tensor; fails for a
+/// non-compact or non-host value.
+fn copy_view(value: &tenferro_ad::ValueGuard<'_>, out: &mut [u8], kind: i32) -> FfiResult<()> {
     macro_rules! copy {
         ($ty:ty) => {
             encode(value.as_slice::<$ty>()?, out)
@@ -232,6 +293,15 @@ fn dot_general_config(dims: &[usize]) -> FfiResult<tenferro_ad::DotGeneralConfig
     })
 }
 
+/// The dense-layer op for `n_inputs` inputs (`W, x[, b]`) and activation code `act`.
+fn dense_op(n_inputs: usize, act: i32) -> FfiResult<dense_extension::DenseOp> {
+    let act = dense_extension::Act::from_code(act).ok_or("unsupported dense activation")?;
+    match n_inputs {
+        2 | 3 => Ok(dense_extension::DenseOp::Dense { act, bias: n_inputs == 3 }),
+        _ => Err("a dense layer takes a weight, an input and an optional bias".into()),
+    }
+}
+
 /// The AD context with tenferro-linalg and remainder rules, shared by all traced graphs so
 /// its AD transform cache persists across calls.
 fn ad_context() -> FfiResult<&'static tenferro_ad::AdContext> {
@@ -243,6 +313,8 @@ fn ad_context() -> FfiResult<&'static tenferro_ad::AdContext> {
                 .with_semantic_extension_rules(rem_extension::rules()?)?
                 .with_semantic_extension_rules(window_extension::rules()?)?
                 .with_semantic_extension_rules(relu_extension::rules()?)?
+                .with_semantic_extension_rules(dense_extension::rules()?)?
+                .with_semantic_extension_rules(xent_extension::rules()?)?
                 .build()?)
         })()
         .map_err(|err| err.to_string())
@@ -304,6 +376,26 @@ pub struct EagerGraph {
     ctx: Option<std::sync::Arc<EagerRuntime>>,
     init_error: String,
     nodes: Vec<EagerTensor>,
+    /// Gradients computed by `vjp_nodes`, read back with `copy_gradient`.
+    grads: Vec<GradEntry>,
+}
+
+/// A reverse-mode result: an accumulated gradient slot, or the node of a per-leaf VJP.
+enum GradEntry {
+    Slot(tenferro_ad::GradientValue),
+    Node(EagerTensor),
+}
+
+/// The one-element unit seed of a scalar output of element type `dtype`.
+fn unit_tensor(dtype: tenferro_ad::DType) -> FfiResult<Tensor> {
+    use tenferro_ad::DType;
+    Ok(match dtype {
+        DType::F32 => Tensor::from_vec_col_major(vec![], vec![1.0f32])?,
+        DType::F64 => Tensor::from_vec_col_major(vec![], vec![1.0f64])?,
+        DType::C32 => Tensor::from_vec_col_major(vec![], vec![num_complex::Complex32::new(1.0, 0.0)])?,
+        DType::C64 => Tensor::from_vec_col_major(vec![], vec![num_complex::Complex64::new(1.0, 0.0)])?,
+        _ => return Err("unsupported seed element type".into()),
+    })
 }
 
 #[julia]
@@ -315,11 +407,13 @@ impl EagerGraph {
                 ctx: Some(ctx),
                 init_error: String::new(),
                 nodes: Vec::new(),
+                grads: Vec::new(),
             },
             Err(err) => Self {
                 ctx: None,
                 init_error: err,
                 nodes: Vec::new(),
+                grads: Vec::new(),
             },
         }
     }
@@ -376,6 +470,13 @@ impl EagerGraph {
         let result = (|| -> FfiResult<()> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let node = self.nodes.get(node).ok_or("invalid node")?;
+            // A compact host value is copied straight out; anything else is duplicated
+            // into a compact tensor first.
+            if let Ok(value) = node.value() {
+                if copy_view(&value, out, kind).is_ok() {
+                    return Ok(());
+                }
+            }
             let value = eager_session(ctx, |s| s.duplicate_value(node))?;
             copy_tensor(&value, out, kind)
         })();
@@ -413,22 +514,26 @@ impl EagerGraph {
     }
 
     /// Reverse-mode derivatives of `output` with respect to every node in `inputs`, from one
-    /// reverse pass. Writes one node id per input to `out` (`-2`: no dependency).
+    /// reverse pass. Writes one gradient id per input to `out` (`-2`: no dependency); read a
+    /// gradient with `copy_gradient`. A negative `seed` is the unit seed of a scalar output.
     #[julia]
     pub fn vjp_nodes(
         &mut self,
         output: usize,
         inputs: &[usize],
-        seed: usize,
+        seed: i64,
         out: &mut [i64],
     ) -> Result<i32, String> {
-        let result = (|| -> FfiResult<Vec<Option<EagerTensor>>> {
+        let result = (|| -> FfiResult<Vec<Option<GradEntry>>> {
             if out.len() != inputs.len() {
                 return Err("output id buffer does not match the inputs".into());
             }
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let y = self.nodes.get(output).ok_or("invalid output")?;
-            let seed = self.nodes.get(seed).ok_or("invalid cotangent")?;
+            let seed = match usize::try_from(seed) {
+                Ok(id) => Some(self.nodes.get(id).ok_or("invalid cotangent")?),
+                Err(_) => None,
+            };
             let xs = inputs
                 .iter()
                 .map(|&id| self.nodes.get(id).ok_or("invalid input"))
@@ -436,38 +541,75 @@ impl EagerGraph {
             for x in &xs {
                 x.clear_grad()?;
             }
-            // `backward_with` differentiates every reachable tracked leaf in one pass. It
-            // fails without accumulating when a reachable leaf has no cotangent flow (for
-            // example through an integer cast); the per-leaf VJPs report that as `None`.
-            if eager_session(ctx, |s| s.backward_with(y, seed)).is_ok() {
+            // `backward` differentiates every reachable tracked leaf in one pass. It fails
+            // without accumulating when a reachable leaf has no cotangent flow (for example
+            // through an integer cast); the per-leaf VJPs report that as `None`.
+            let pass = eager_session(ctx, |s| match seed {
+                Some(seed) => s.backward_with(y, seed),
+                None => s.backward(y),
+            });
+            if pass.is_ok() {
                 let grads = xs
                     .iter()
-                    .map(|x| -> FfiResult<Option<EagerTensor>> {
-                        x.grad()?
-                            .map(|grad| Ok(ctx.constant_from(gradient_tensor(&grad)?)?))
-                            .transpose()
-                    })
-                    .collect::<FfiResult<Vec<_>>>();
+                    .map(|x| x.grad().map(|grad| grad.map(GradEntry::Slot)))
+                    .collect::<Result<Vec<_>, _>>();
                 for x in &xs {
                     x.clear_grad()?;
                 }
-                // A gradient that cannot be read back falls through to the per-leaf VJPs.
                 if let Ok(grads) = grads {
                     return Ok(grads);
                 }
             }
+            let unit;
+            let seed = match seed {
+                Some(seed) => seed,
+                None => {
+                    unit = ctx.constant_from(unit_tensor(y.dtype())?)?;
+                    &unit
+                }
+            };
             xs.iter()
-                .map(|x| Ok(eager_session(ctx, |s| s.vjp_optional(y, x, seed))?))
+                .map(|x| Ok(eager_session(ctx, |s| s.vjp_optional(y, x, seed))?.map(GradEntry::Node)))
                 .collect()
         })();
         let grads = result.map_err(|err| err.to_string())?;
         for (slot, grad) in out.iter_mut().zip(grads) {
             *slot = match grad {
-                Some(value) => self.push(value),
+                Some(grad) => {
+                    self.grads.push(grad);
+                    (self.grads.len() - 1) as i64
+                }
                 None => -2,
             };
         }
         Ok(0)
+    }
+
+    /// Copy gradient `id` (from `vjp_nodes`) into `out`.
+    #[julia]
+    pub fn copy_gradient(&self, id: usize, out: &mut [u8], kind: i32) -> Result<i32, String> {
+        let result = (|| -> FfiResult<()> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            match self.grads.get(id).ok_or("invalid gradient")? {
+                GradEntry::Slot(grad) => {
+                    if let Ok(value) = grad.value() {
+                        if copy_view(&value, out, kind).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    copy_tensor(&gradient_tensor(grad)?, out, kind)
+                }
+                GradEntry::Node(node) => {
+                    if let Ok(value) = node.value() {
+                        if copy_view(&value, out, kind).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    copy_tensor(&eager_session(ctx, |s| s.duplicate_value(node))?, out, kind)
+                }
+            }
+        })();
+        result.map(|_| 0).map_err(|err| err.to_string())
     }
 
     #[julia]
@@ -967,6 +1109,36 @@ impl EagerGraph {
         Ok(self.push(value))
     }
 
+    /// `act(W x [+ b])` for `inputs = [W, x[, b]]` and activation code `act` (see
+    /// `dense_extension::Act::from_code`).
+    #[julia]
+    pub fn dense_node(&mut self, inputs: &[usize], act: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let op = dense_op(inputs.len(), act)?;
+            let xs = inputs
+                .iter()
+                .map(|&i| self.nodes.get(i).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(eager_session(ctx, |s| dense_extension::apply_eager(s, op, &xs))?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    /// `-scale * sum(y .* logsoftmax(yhat; dims=1))` for `c × n` logits and targets.
+    #[julia]
+    pub fn xent_node(&mut self, yhat: usize, y: usize, scale: f64) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let yhat = self.nodes.get(yhat).ok_or("invalid logits")?;
+            let y = self.nodes.get(y).ok_or("invalid targets")?;
+            Ok(eager_session(ctx, |s| xent_extension::apply_eager(s, scale, yhat, y))?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
     #[julia]
     pub fn pad_node(&mut self, input: usize, amounts: &[i64]) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
@@ -1019,6 +1191,12 @@ fn run_traced(outputs: &[&tenferro_runtime::TracedTensor]) -> FfiResult<Vec<Tens
             tenferro_cpu::CpuEngine,
         >(tenferro_cpu::runtime_engine_id()?)?)?;
         builder.install_extension_module(relu_extension::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        builder.install_extension_module(dense_extension::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        builder.install_extension_module(xent_extension::extension_module::<
             tenferro_cpu::CpuEngine,
         >(tenferro_cpu::runtime_engine_id()?)?)?;
         builder.install_extension_module(tenferro_linalg::extension_module::<
@@ -1525,6 +1703,40 @@ impl TracedGraph {
                 .into_iter()
                 .next()
                 .ok_or("missing window output")?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_dense_node(&mut self, inputs: &[usize], act: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let op = dense_op(inputs.len(), act)?;
+            let xs = inputs
+                .iter()
+                .map(|&i| self.nodes.get(i).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(tenferro_runtime::extension::apply(std::sync::Arc::new(op), &xs)?
+                .into_iter()
+                .next()
+                .ok_or("missing dense output")?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_xent_node(&mut self, yhat: usize, y: usize, scale: f64) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let yhat = self.nodes.get(yhat).ok_or("invalid logits")?;
+            let y = self.nodes.get(y).ok_or("invalid targets")?;
+            Ok(tenferro_runtime::extension::apply(
+                std::sync::Arc::new(xent_extension::XentOp::loss(scale)),
+                &[yhat, y],
+            )?
+            .into_iter()
+            .next()
+            .ok_or("missing cross-entropy output")?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))

@@ -208,6 +208,26 @@ tenferro-rs `scatter`; repeated indices accumulate. Other operators (`max`,
 `min`, `*`, `/`) throw an `ArgumentError`. Indices are checked on the host;
 out-of-range indices throw a `BoundsError` instead of being clamped.
 
+### Dense layers and cross-entropy
+
+`Tenferro.dense(σ, W, x, b=nothing)` computes `σ.(W * x .+ b)` for a weight matrix, an
+input vector or matrix and an optional bias vector, and `Tenferro.logitcrossentropy(ŷ, y;
+agg=mean)` computes the softmax cross-entropy of logits with classes along the first
+dimension (`Lux.CrossEntropyLoss(; logits=Val(true))` without label smoothing). Both are
+part of Tenferro itself and need no package extension; `NNlib.relu` is recognized as a
+native dense activation once NNlib is loaded.
+
+| Function | Implementation |
+|---|---|
+| `dense` with `identity` or `relu`, `Float32`/`Float64` operands | one native kernel: a GEMM (Julia's BLAS) followed by one pass for the bias and the activation; its tangent and cotangent maps are native kernels of the same family, so derivatives of any order stay native |
+| `dense` with any other activation or element type | `W * x` (`dot_general`), a bias broadcast and `σ.(...)` |
+| `logitcrossentropy`, `Float32`/`Float64` logits, `agg` `mean` or `sum` | one native kernel per column pass: a log-sum-exp, then the loss, its gradient (`softmax(ŷ) .* sum(y; dims=1) .- y`, scaled) or its pushforward |
+
+The cross-entropy's first derivatives (gradients, pullbacks, pushforwards) are native for
+both logits and targets. Second derivatives through the softmax, such as a Hessian with
+respect to the logits, are not implemented and throw an error. Other element types and
+aggregations throw an `ArgumentError`.
+
 ## Reductions
 
 `sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean` accept `dims`;

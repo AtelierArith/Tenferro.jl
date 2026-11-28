@@ -79,8 +79,9 @@ _forward_id(ctx::EagerContext, output, input, seed) =
 _forward_id(ctx::TracedContext, output, input, seed) =
     RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_derivative, UInt(output.id), UInt(input.id), UInt(seed.id), true))
 
+# Eager ids are gradient ids (read with `copy_gradient`); `seed === nothing` is the unit seed.
 _reverse_ids!(ids, ctx::EagerContext, output, leaves, seed) =
-    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.vjp_nodes, UInt(output.id), UInt[leaf.id for leaf in leaves], UInt(seed.id), ids))
+    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.vjp_nodes, UInt(output.id), UInt[leaf.id for leaf in leaves], seed === nothing ? Int64(-1) : Int64(seed.id), ids))
 _reverse_ids!(ids, ctx::TracedContext, output, leaves, seed) =
     RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_vjp_nodes, UInt(output.id), UInt[leaf.id for leaf in leaves], UInt(seed.id), ids))
 
@@ -99,11 +100,15 @@ function _reverse(ctx, output, inputs, seed, want_value::Bool)
     _evaluate(ctx, [want_value ? [output.id] : Int64[]; filter(>=(0), ids)])
     grads = Dict{Int64,Any}()
     for (leaf, id) in zip(leaves, ids)
-        grads[leaf.id] = id == -2 ? zeros(eltype(leaf), leaf.dims) :
-            Array(_derivative_tensor(ctx, eltype(leaf), id, leaf.dims))
+        grads[leaf.id] = id == -2 ? zeros(eltype(leaf), leaf.dims) : _gradient_array(ctx, eltype(leaf), id, leaf.dims)
     end
     return _tree_map(input -> grads[input.id]::Array{eltype(input),length(input.dims)}, inputs)
 end
+
+_gradient_array(ctx::EagerContext, ::Type{T}, id, dims) where {T} = _read_array(T, dims) do out
+    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.copy_gradient, UInt(id), out, _typed_kind(T)))
+end
+_gradient_array(ctx::TracedContext, ::Type{T}, id, dims) where {T} = Array(_derivative_tensor(ctx, T, id, dims))
 
 # Forward-mode derivative; `nothing` when the output does not depend on `input`.
 function _forward(ctx, output, input, seed)
@@ -116,7 +121,8 @@ end
 function _gradient(backend::_Backend, f::F, x, contexts, want_value::Bool) where {F}
     _record(backend, f, x, contexts) do ctx, inputs, output
         _is_scalar(output) || throw(ArgumentError("gradient requires a scalar output"))
-        seed = _seed(ctx, fill(one(eltype(output))))
+        # The eager unit seed is made on the Rust side.
+        seed = ctx isa EagerContext ? nothing : _seed(ctx, fill(one(eltype(output))))
         if want_value && ctx isa TracedContext && eltype(output) <: Real
             # The value as the gradient of `output * s` at `s = 1`: it comes out of the
             # derivative program, which computes the forward pass anyway, instead of a
