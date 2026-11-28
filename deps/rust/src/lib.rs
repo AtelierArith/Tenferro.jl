@@ -1,5 +1,8 @@
 mod engine;
+mod kernels;
 mod rem_extension;
+mod relu_extension;
+mod window_extension;
 
 use rustcall_julia_macros::julia;
 use tenferro_ad::{EagerRuntime, EagerSession, EagerTensor, Tensor};
@@ -238,6 +241,8 @@ fn ad_context() -> FfiResult<&'static tenferro_ad::AdContext> {
             Ok(tenferro_ad::AdContext::builder()
                 .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
                 .with_semantic_extension_rules(rem_extension::rules()?)?
+                .with_semantic_extension_rules(window_extension::rules()?)?
+                .with_semantic_extension_rules(relu_extension::rules()?)?
                 .build()?)
         })()
         .map_err(|err| err.to_string())
@@ -918,6 +923,7 @@ impl EagerGraph {
                     2 => s.softplus(x),
                     3 => s.gelu(x),
                     4 => s.gelu_tanh(x),
+                    5 => relu_extension::apply_eager(s, x),
                     _ => unreachable!(),
                 })?,
             )
@@ -940,6 +946,22 @@ impl EagerGraph {
                     }
                 })?,
             )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    /// Apply window kernel `kind` (see `window_extension`) to `inputs`.
+    #[julia]
+    pub fn window_node(&mut self, inputs: &[usize], kind: i32, geometry: &[i64]) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let op = window_extension::WindowOp::new(kind, geometry)?;
+            let xs = inputs
+                .iter()
+                .map(|&i| self.nodes.get(i).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(eager_session(ctx, |s| window_extension::apply_eager(s, op, &xs))?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -991,6 +1013,12 @@ fn run_traced(outputs: &[&tenferro_runtime::TracedTensor]) -> FfiResult<Vec<Tens
         let mut builder = Runtime::builder();
         builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
         builder.install_extension_module(rem_extension::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        builder.install_extension_module(window_extension::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        builder.install_extension_module(relu_extension::extension_module::<
             tenferro_cpu::CpuEngine,
         >(tenferro_cpu::runtime_engine_id()?)?)?;
         builder.install_extension_module(tenferro_linalg::extension_module::<
@@ -1456,6 +1484,13 @@ impl TracedGraph {
                 2 => x.softplus()?,
                 3 => x.gelu()?,
                 4 => x.gelu_tanh()?,
+                5 => tenferro_runtime::extension::apply(
+                    std::sync::Arc::new(relu_extension::ReluOp { mask: false }),
+                    &[x],
+                )?
+                .into_iter()
+                .next()
+                .ok_or("missing relu output")?,
                 _ => unreachable!(),
             })
         })();
@@ -1472,6 +1507,24 @@ impl TracedGraph {
             } else {
                 x.softmax(axis as isize)?
             })
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    /// Traced [`EagerGraph::window_node`].
+    #[julia]
+    pub fn traced_window_node(&mut self, inputs: &[usize], kind: i32, geometry: &[i64]) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let op = window_extension::WindowOp::new(kind, geometry)?;
+            let xs = inputs
+                .iter()
+                .map(|&i| self.nodes.get(i).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(tenferro_runtime::extension::apply(std::sync::Arc::new(op), &xs)?
+                .into_iter()
+                .next()
+                .ok_or("missing window output")?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))

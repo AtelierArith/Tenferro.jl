@@ -165,7 +165,8 @@ These operations are available after `using NNlib` (package extension `TenferroN
 | NNlib function | Implementation and derivative at kinks |
 |---|---|
 | `sigmoid`/`σ`, `sigmoid_fast`, `softplus`, `swish`, `gelu`/`gelu_tanh`, `gelu_erf` | tenferro-rs activation kernels (overflow-free `sigmoid` and `softplus`) |
-| `relu`, `relu6`, `trelu` | `select`; derivative `0` at every kink |
+| `relu` | native kernel `x > 0 ? x : 0` (a tenferro-rs extension, with derivative `x > 0`: `0` at the kink) |
+| `relu6`, `trelu` | `select`; derivative `0` at every kink |
 | `leakyrelu(x, a=0.01)` | `select`; derivative `a` at `0` |
 | `elu(x, α=1)`, `celu(x, α=1)`, `selu` | `select` with `expm1`; `elu'(0) == celu'(0) == 1`, `selu'(0) == λα` |
 | `hardσ`, `hardtanh`, `softshrink(x, λ=0.5)` | `select`; derivative `0` at the kinks |
@@ -182,22 +183,22 @@ The activations accept `Float32` and `Float64` tensors, and eager scalars. `leak
 
 ### Convolution, pooling and upsampling
 
-tenferro-rs has no convolution or `reduce_window` primitive, so these functions are composed from its `pad`, `slice`, `concatenate`, `dot_general`, reduction and `select` kernels. They follow NNlib's WHCN layout, `(spatial..., channels, batch)` with one to three spatial dimensions, and NNlib's argument conventions; gradients are those of the composed kernels.
+tenferro-rs has no convolution or `reduce_window` primitive. For `Float32` and `Float64` tensors, Tenferro's bridge adds native window kernels as a tenferro-rs extension family: `im2col` (copy every window into a column matrix) and its transpose `col2im`, window sums and their transpose, and first-maximum pooling with its tangent and cotangent maps. Every derivative of a member is a member again, so pushforwards and pullbacks of any order run on these kernels, eagerly and traced. Other element types (complex tensors) compose the same operations from `pad`, `slice`, `concatenate`, reduction and `select` kernels. All of them follow NNlib's WHCN layout, `(spatial..., channels, batch)` with one to three spatial dimensions, and NNlib's argument conventions.
 
 | NNlib function | Implementation |
 |---|---|
-| `conv(x, w; stride, pad, dilation, flipped, groups)`, `conv(x, w, ::DenseConvDims)` | zero `pad`, one strided `slice` per kernel offset concatenated into windows (im2col), then one `dot_general` over kernel offsets and input channels; groups are a `dot_general` batch dimension |
+| `conv(x, w; stride, pad, dilation, flipped, groups)`, `conv(x, w, ::DenseConvDims)` | `im2col` of `x` into a `(kernel..., C_in, out..., batch)` matrix, then one `dot_general` over kernel offsets and input channels; groups are a `dot_general` batch dimension |
 | `depthwiseconv(x, w; ...)`, `depthwiseconv(x, w, ::DepthwiseConvDims)` | grouped `conv` with `groups = C_in` |
 | `∇conv_data(dy, w, cdims)`, `∇depthwiseconv_data` | transposed convolution: `conv` of `dy` with interior (stride) padding and the channel-swapped kernel reversed once more |
 | `∇conv_filter(x, dy, cdims)`, `∇depthwiseconv_filter` | windows of `x` contracted with `dy` |
-| `maxpool(x, k; pad, stride, ceil_mode)`, `maxpool(x, ::PoolDims)` | running maximum over one strided slice per kernel offset of the input padded with `-Inf`, updated by `select` only where an entry is strictly larger, so each window's gradient goes to its first maximum in kernel order, as in NNlib's `∇maxpool` |
+| `maxpool(x, k; pad, stride, ceil_mode)`, `maxpool(x, ::PoolDims)` | running maximum over the kernel offsets in column-major order, padding counting as `-Inf`, replaced only by a strictly larger entry, so each window's gradient goes to its first maximum in kernel order, as in NNlib's `∇maxpool` |
 | `meanpool(x, k; pad, stride, count_include_pad, ceil_mode)`, `meanpool(x, ::PoolDims)` | window sums divided by NNlib's per-window count: all window positions inside the padded input, or only those inside the input with `count_include_pad=false` |
 | `lpnormpool(x, p, k; pad, stride, ceil_mode)`, `lpnormpool(x, ::PoolDims; p)` | `(∑ xᵢ^p)^(1/p)` over each window (padding contributes nothing) |
 | `upsample_nearest(x, scales)`, `upsample_nearest(x; size)` | `broadcast_to` of a reshaped tensor |
 | `upsample_linear`, `upsample_bilinear`, `upsample_trilinear` (scale or `size`, both `align_corners`) | one pair of axis `gather`s with constant interpolation weights per resized dimension (NNlib's source positions) |
 | `pixel_shuffle(x, r)` | `reshape` and `permutedims` |
 
-`PoolDims`, `DenseConvDims` and `DepthwiseConvDims` accept tensors in place of arrays. Either operand of `conv`, `depthwiseconv`, `∇conv_data` and `∇conv_filter` may be a constant Julia array. `maximum` and `minimum` accept `init` (Lux's `GlobalMaxPool` calls `maximum(x; dims, init=-Inf)`), so Lux's global and adaptive pooling layers work. Convolution windows are built from `sum(kernel)` slices and concatenations (one per kernel offset and dimension); mean and Lp pooling sum `prod(kernel)` output-sized slices, or reshape and reduce when the windows do not overlap (stride equal to the kernel size). Anti-aliased bilinear upsampling, `upsample_bicubic` and complex inputs are not provided.
+`PoolDims`, `DenseConvDims` and `DepthwiseConvDims` accept tensors in place of arrays. Either operand of `conv`, `depthwiseconv`, `∇conv_data` and `∇conv_filter` may be a constant Julia array. `maximum` and `minimum` accept `init` (Lux's `GlobalMaxPool` calls `maximum(x; dims, init=-Inf)`), so Lux's global and adaptive pooling layers work. Anti-aliased bilinear upsampling, `upsample_bicubic` and complex inputs are not provided.
 
 `NNlib.gather(src, idx)` (and `gather(src, I, J, ...)`) accepts integers,
 integer tuples and `CartesianIndex`es as indices: one axis gather of `src` with

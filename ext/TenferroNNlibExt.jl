@@ -24,7 +24,7 @@ _tanh(x) = B.broadcasted(tanh, x)
 _sigmoid(x) = Tenferro._sigmoid(x)
 _softplus(x) = Tenferro._softplus(x)
 
-_relu(x) = _sel(_gt(x, 0), x, 0)
+_relu(x) = Tenferro._relu(x)
 _relu6(x) = _sel(_gt(x, 0), _sel(_lt(x, 6), x, _c(x, 6)), 0)
 _leakyrelu(x, a=NNlib.leakyrelu_a) = _sel(_gt(x, 0), x, _mul(x, _c(x, a)))
 _elu(x, α=1) = _sel(_ge(x, 0), x, _mul(B.broadcasted(expm1, _nonpos(x)), _c(x, α)))

@@ -35,6 +35,8 @@ _silu(a::_FloatTensor) = _activation(a, 1)
 _softplus(a::_FloatTensor) = _activation(a, 2)
 _gelu_erf(a::_FloatTensor) = _activation(a, 3)
 _gelu_tanh(a::_FloatTensor) = _activation(a, 4)
+# `x > 0 ? x : 0` with derivative `x > 0` (zero at the kink, like NNlib), in one native pass.
+_relu(a::_FloatTensor) = _activation(a, 5)
 
 # Softmax family ------------------------------------------------------------------
 
@@ -170,10 +172,11 @@ _batched_adjoint(a::_ADTensor) = eltype(a) <: Real ? _batched_transpose(a) : con
 
 # Sliding windows ----------------------------------------------------------------------
 #
-# tenferro-rs has no convolution or `reduce_window` primitive. Convolution and
-# pooling gather every window with one axis gather per spatial dimension: dimension
-# `d` of length `n` becomes the pair `(k, out)` of kernel offset and output
-# position. Non-overlapping windows (stride == kernel) are a plain reshape. The gathers' derivatives scatter-add back, so gradients follow.
+# tenferro-rs has no convolution or `reduce_window` primitive. Float32/Float64
+# tensors use the native window kernels below; other element types compose the
+# windows from slices: dimension `d` of length `n` becomes the pair `(k, out)` of
+# kernel offset and output position. Non-overlapping windows (stride == kernel)
+# are a plain reshape. The slices' derivatives scatter-add back, so gradients follow.
 
 _zeros(n) = ntuple(_ -> 0, n)
 
@@ -255,6 +258,41 @@ end
 
 _conv_out(n, k, s, d, lo, hi) = div(n + lo + hi - (k - 1) * d - 1, s) + 1
 
+# Native window kernels -------------------------------------------------------------------
+#
+# Float32/Float64 tensors gather windows with the native kernels of the bridge
+# (`deps/rust/src/window_extension.rs`): one pass per kernel instead of one
+# tensor per kernel offset. Their derivatives are window kernels again.
+
+const _NativeWindow = Union{EagerTensor{<:Union{Float32,Float64}},TracedTensor{<:Union{Float32,Float64}}}
+const _IM2COL, _COL2IM, _SUMPOOL, _SUMPOOLT, _MAXPOOL = 0, 1, 2, 3, 4
+
+function _window_kernel(kind, x::_ADTensor, outdims, kernel, stride, dilation, lo, out;
+                        interior=_zeros(length(kernel)), flip::Bool=false, split::Integer=0)
+    all(>(0), out) || throw(DimensionMismatch("the windows do not fit into the padded input"))
+    S = length(kernel)
+    geometry = Int64[S, ndims(x), split, flip, x.dims..., kernel..., stride..., dilation..., lo..., out..., interior...]
+    id = _bridge(x, RustCrate.window_node, RustCrate.traced_window_node, UInt[x.id], Int32(kind), geometry)
+    _wrap(x, eltype(x), id, outdims)
+end
+
+"""
+    _im2col(x, kernel, stride, dilation, lo, out; flip=false, interior=zeros)
+
+The windows of `_windows` laid out `(kernel..., C, out..., batch)` for
+`x = (spatial..., C, batch)`: one matrix whose columns are the flattened windows.
+"""
+function _im2col(x::_NativeWindow, kernel, stride, dilation, lo, out; flip::Bool=false,
+                 interior=_zeros(length(kernel)))
+    S = length(kernel)
+    _window_kernel(_IM2COL, x, (kernel..., x.dims[S + 1], out..., x.dims[(S + 2):end]...), kernel, stride,
+                   dilation, lo, out; interior=interior, flip=flip, split=1)
+end
+
+# Window sums (`_SUMPOOL`) or first maxima (`_MAXPOOL`) with dimensions `(out..., rest...)`.
+_pool_kernel(kind, x::_NativeWindow, kernel, stride, dilation, lo, out) =
+    _window_kernel(kind, x, (out..., x.dims[(length(kernel) + 1):end]...), kernel, stride, dilation, lo, out)
+
 """
     _conv(x, w, stride, lo, hi, dilation, groups, flip; interior=zeros)
 
@@ -274,6 +312,18 @@ function _conv(x::_ADTensor, w::_ADTensor, stride, lo, hi, dilation, groups::Int
     w.dims[S + 1] * g == cin || throw(DimensionMismatch("expected $(w.dims[S + 1] * g) input channels, got $cin"))
     n = ntuple(d -> x.dims[d] + max(x.dims[d] - 1, 0) * interior[d], S)
     out = ntuple(d -> _conv_out(n[d], kernel[d], stride[d], dilation[d], lo[d], hi[d]), S)
+    if x isa _NativeWindow
+        cols = _im2col(x, kernel, stride, dilation, lo, out; flip=flip, interior=interior)
+        sp = ntuple(identity, S + 1)
+        y = if g == 1
+            _dot_general(cols, w, sp, sp)
+        else
+            p = reshape(cols, (kernel..., cin ÷ g, g, out..., batch))
+            wg = reshape(w, (kernel..., cin ÷ g, cout ÷ g, g))
+            reshape(_dot_general(p, wg, sp, sp, (S + 2,), (S + 3,)), (out..., batch, cout))
+        end
+        return permutedims(y, (ntuple(identity, S)..., S + 2, S + 1))
+    end
     patches = _windows(x, kernel, stride, dilation, lo, out; flip=flip, interior=interior)
     kd = ntuple(d -> 2d - 1, S)
     y = if g == 1
@@ -330,9 +380,17 @@ function _conv_filter(x::_ADTensor, dy::_ADTensor, kernel, stride, lo, dilation,
     out = dy.dims[1:S]
     cin, batch, cout = x.dims[S + 1], x.dims[S + 2], dy.dims[S + 1]
     g = Int(groups)
+    sp = ntuple(identity, S)
+    if x isa _NativeWindow
+        cols = _im2col(x, kernel, stride, dilation, lo, out; flip=flip)
+        g == 1 && return _dot_general(cols, dy, (map(d -> d + S + 1, sp)..., 2S + 2), (sp..., S + 2))
+        p = reshape(cols, (kernel..., cin ÷ g, g, out..., batch))
+        dyg = reshape(dy, (out..., cout ÷ g, g, batch))
+        return reshape(_dot_general(p, dyg, (map(d -> d + S + 2, sp)..., 2S + 3), (sp..., S + 3), (S + 2,), (S + 2,)),
+                       (kernel..., cin ÷ g, cout))
+    end
     patches = _windows(x, kernel, stride, dilation, lo, out; flip=flip)
     od = ntuple(d -> 2d, S)
-    sp = ntuple(identity, S)
     g == 1 && return _dot_general(patches, dy, (od..., 2S + 2), (sp..., S + 2))
     p = reshape(patches, (patches.dims[1:(2S)]..., cin ÷ g, g, batch))
     dyg = reshape(dy, (out..., cout ÷ g, g, batch))
@@ -368,7 +426,10 @@ function _pool(x::_ADTensor, mode::Symbol, kernel, stride, lo, hi, dilation, out
     # Non-overlapping windows are a reshape: reduce them directly. Otherwise
     # combine one output-sized slice per kernel offset.
     disjoint = all(d -> stride[d] == kernel[d] && (dilation[d] == 1 || kernel[d] == 1), 1:S)
-    if mode === :max
+    native = x isa _NativeWindow
+    if mode === :max && native
+        return _pool_kernel(_MAXPOOL, x, kernel, stride, dilation, lo, out)
+    elseif mode === :max
         # NNlib's scan: a later entry replaces the running maximum only if it is
         # larger, so the gradient of each window goes to its first maximum.
         y, off = _window_input(x, kernel, stride, dilation, lo, out; fill=typemin(T))
@@ -380,7 +441,9 @@ function _pool(x::_ADTensor, mode::Symbol, kernel, stride, lo, hi, dilation, out
         return m
     end
     lift = mode === :lpnorm ? (v -> _B.broadcasted(^, v, p)) : identity
-    s = if disjoint
+    s = if native
+        _pool_kernel(_SUMPOOL, lift(x), kernel, stride, dilation, lo, out)
+    elseif disjoint
         reshape(sum(lift(_windows(x, kernel, stride, dilation, lo, out)); dims=kd), (out..., rest...))
     else
         y, off = _window_input(x, kernel, stride, dilation, lo, out)

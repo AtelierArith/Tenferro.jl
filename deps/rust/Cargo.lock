@@ -1256,6 +1256,7 @@ dependencies = [
  "rustcall_julia_macros",
  "tenferro-ad",
  "tenferro-cpu",
+ "tenferro-cpu-basic",
  "tenferro-linalg",
  "tenferro-runtime",
  "tenferro-tensor",
