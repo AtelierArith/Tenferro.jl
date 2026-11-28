@@ -127,6 +127,9 @@ end
         @test check_values(x -> maxpool(x, k; pad=1, stride=1), x)
         @test check_values(x -> meanpool(x, k; stride=2, ceil_mode=true, count_include_pad=false), x)
         @test check_values(x -> lpnormpool(x, 1.5, k; pad=1), abs.(x))
+        # Lux's LPPool default: integer p on signed inputs.
+        @test check_values(x -> lpnormpool(x, 2, k; stride=1), x)
+        @test check_gradient(lpnormpool, x, PoolDims(size(x), k; stride=1); p=2)
     end
 end
 
