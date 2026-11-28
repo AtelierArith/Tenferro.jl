@@ -110,7 +110,10 @@ Loading NNlib.jl together with Tenferro activates the `TenferroNNlibExt` package
 - activation broadcasts such as `relu.(x)`, `gelu.(x)`, `swish.(x)`, `sigmoid.(x)`, `softplus.(x)` and `leakyrelu.(x, 0.2)`, plus `NNlib.fast_act(f, x)`. Derivatives at kinks follow NNlib's ChainRules (for example `relu'(0) == 0`);
 - `softmax`, `logsoftmax` and `logsumexp` with `dims`;
 - `batched_mul` (`⊠`), `batched_transpose` and `batched_adjoint`;
-- `pad_zeros` and `pad_constant`.
+- `pad_zeros` and `pad_constant`;
+- `conv` (stride, asymmetric padding, dilation, groups, `flipped`), `depthwiseconv`, `∇conv_data` (transposed convolution) and `∇conv_filter` with 1-3 spatial dimensions;
+- `maxpool` (gradients go to the first maximum of each window, like NNlib), `meanpool` and `lpnormpool` with `PoolDims` or keywords, including what Lux's global and adaptive pooling layers call;
+- `upsample_nearest`, `upsample_linear`/`upsample_bilinear`/`upsample_trilinear` (both `align_corners`) and `pixel_shuffle`.
 
 ```julia
 using Tenferro, NNlib, DifferentiationInterface
@@ -120,7 +123,13 @@ ps = (W = [1.0 -2.0; 0.5 1.5], b = [0.1, -0.3])
 value, g = value_and_gradient(layer, AutoTenferro(), ps, Constant([1.0, 2.0]))
 ```
 
-Convolution, pooling, upsampling, normalization and dropout are not yet provided.
+```julia
+x = randn(Float32, 28, 28, 1, 8)
+cnn(w) = sum(maxpool(relu.(conv(x, w; pad=1)), (2, 2)))
+g = gradient(cnn, AutoTenferroTraced(), randn(Float32, 3, 3, 1, 4))
+```
+
+Normalization layers and dropout are not yet provided.
 
 ## Tests and documentation
 

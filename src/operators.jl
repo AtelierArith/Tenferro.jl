@@ -250,9 +250,12 @@ function _reduce_all(a::TracedTensor, op)
     length(a) == 0 && return _empty_reduction(a, :, op)
     _shape_op(a, ntuple(i -> i - 1, length(a.dims)), op, ())
 end
-for (op, code) in ((:prod, 4), (:maximum, 5), (:minimum, 6))
-    @eval function Base.$op(a::_ADTensor; dims=:)
-        dims isa Colon ? _reduce_all(a, $code) : _reduce_dims(a, dims, $code)
+# `init` is folded in with one more elementwise operation (e.g. Lux's
+# `maximum(x; dims, init=-Inf)` for global max pooling).
+for (op, code, combine) in ((:prod, 4, :*), (:maximum, 5, :max), (:minimum, 6, :min))
+    @eval function Base.$op(a::_ADTensor; dims=:, init=nothing)
+        r = dims isa Colon ? _reduce_all(a, $code) : _reduce_dims(a, dims, $code)
+        init === nothing ? r : Base.Broadcast.broadcasted($combine, r, init)
     end
 end
 function Base.reverse(a::_ADTensor; dims=:)
