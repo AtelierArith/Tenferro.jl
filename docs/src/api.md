@@ -19,6 +19,8 @@ context
 DifferentiableElement
 num_threads
 set_num_threads
+dense
+logitcrossentropy
 ```
 
 Element-type conversion and rounding use Base's functions on tensors: `S.(x)`,

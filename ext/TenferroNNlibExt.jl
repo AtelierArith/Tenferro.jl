@@ -80,6 +80,9 @@ for (f, impl) in ((NNlib.leakyrelu, _leakyrelu), (NNlib.elu, _elu), (NNlib.celu,
     @eval B.broadcasted(::typeof($f), x::_FloatTensor, p::Real) = $impl(x, p)
 end
 
+# `relu` dense layers run on the native dense kernel (`Tenferro.dense`).
+Tenferro._dense_act(::typeof(NNlib.relu)) = Int32(1)
+
 # Every function is usable as is; there is no faster tensor variant to swap in.
 NNlib.fast_act(f::F, ::Union{_ADTensor,EagerScalar}) where {F<:Function} = f
 

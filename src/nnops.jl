@@ -609,3 +609,97 @@ function _scatter(op::Symbol, src::_ADTensor, idx::AbstractArray, init, dstsize)
     end
     init === nothing || iszero(init) ? s : _B.broadcasted(+, s, init)
 end
+
+# Dense layers and cross-entropy -------------------------------------------------------
+
+# Activation codes of the native dense kernel; `nothing`: composed with broadcasting.
+# The NNlib extension adds `relu`.
+_dense_act(::typeof(identity)) = Int32(0)
+_dense_act(::Any) = nothing
+
+_dense_lift(ref, x::_ADTensor, ::Type{T}) where {T} = (_same_graph(ref, x); x)
+_dense_lift(ref, x::AbstractArray, ::Type{T}) where {T} = _constant_tensor(ref, convert(AbstractArray{T}, x))
+_dense_lift(ref, ::Nothing, ::Type{T}) where {T} = nothing
+
+_native_float(::Type{T}) where {T} = T === Float32 || T === Float64
+
+"""
+    Tenferro.dense(σ, W, x, b=nothing)
+
+`σ.(W * x .+ b)`, a dense (fully connected) layer: a weight matrix `W` (`out × in`), an
+input vector or matrix `x` (`in` or `in × batch`) and an optional bias vector `b` (length
+`out`). The result has the shape of `W * x`. Any of the operands may be a plain array as
+long as one is a tensor; arrays become constants of the tensor's context.
+
+When all operands have element type `Float32` or `Float64` and `σ` is `identity` or
+`NNlib.relu` (with NNlib loaded), the product, the bias and the activation run as one
+native kernel, and pushforwards and pullbacks of any order are native kernels too. The
+derivative of `relu` at 0 is 0, as in NNlib. The matrix products call Julia's BLAS through
+libblastrampoline, so they run on `BLAS.get_num_threads()` threads. Other activations and
+element types compose `W * x`, the bias and `σ.(...)` from tensor operations, with the same
+results.
+
+# Examples
+
+```julia
+using Tenferro, NNlib
+ctx = EagerContext()
+W = EagerTensor(ctx, [1.0 -2.0; 0.5 1.0])
+y = Tenferro.dense(relu, W, [1.0, 1.0], [0.0, -2.0])   # [0.0, 0.0]
+```
+"""
+function dense(σ::F, W, x, b=nothing) where {F}
+    ndims(W) == 2 || throw(ArgumentError("dense weight must be a matrix, got $(ndims(W)) dimensions"))
+    b === nothing || ndims(b) == 1 || throw(ArgumentError("dense bias must be a vector, got $(ndims(b)) dimensions"))
+    ndims(x) == 1 && return vec(dense(σ, W, reshape(x, (length(x), 1)), b))
+    ndims(x) == 2 || throw(ArgumentError("dense input must be a vector or a matrix, got $(ndims(x)) dimensions"))
+    size(W, 2) == size(x, 1) || throw(DimensionMismatch("weight has $(size(W, 2)) columns but the input has $(size(x, 1)) rows"))
+    b === nothing || length(b) == size(W, 1) || throw(DimensionMismatch("bias length $(length(b)) does not match $(size(W, 1)) outputs"))
+    ref = _reference(W, x, b)
+    T = eltype(ref)
+    act = _dense_act(σ)
+    if act !== nothing && _native_float(T) && all(v -> v === nothing || eltype(v) === T, (W, x, b))
+        Wt, xt, bt = _dense_lift(ref, W, T), _dense_lift(ref, x, T), _dense_lift(ref, b, T)
+        ids = bt === nothing ? UInt[Wt.id, xt.id] : UInt[Wt.id, xt.id, bt.id]
+        id = _bridge(ref, RustCrate.dense_node, RustCrate.traced_dense_node, ids, act)
+        return _wrap(ref, T, id, (size(W, 1), size(x, 2)))
+    end
+    y = W * x
+    b === nothing || (y = _B.broadcasted(+, y, reshape(b, (length(b), 1))))
+    return σ === identity ? y : _B.broadcasted(σ, y)
+end
+
+"""
+    Tenferro.logitcrossentropy(ŷ, y; agg=mean)
+
+Softmax cross-entropy of the logits `ŷ` against the targets `y`, with classes along the
+first dimension: the column losses `-sum(y .* logsoftmax(ŷ; dims=1); dims=1)` aggregated by
+`agg`, which is `mean` or `sum`. `ŷ` is a `Float32` or `Float64` tensor, and `y` (one-hot
+or probabilities) is a tensor or an array of the same size and element type. Trailing
+dimensions count as columns. This is `Lux.CrossEntropyLoss(; logits=Val(true), agg)`
+without label smoothing. The result is a scalar of the logits' context.
+
+The loss, its gradient and its pushforward each run as one native kernel. Second
+derivatives through the softmax (for example a Hessian with respect to `ŷ`) are not
+implemented and throw an error.
+"""
+function logitcrossentropy(ŷ::_ADTensor, y; agg=Statistics.mean)
+    agg === Statistics.mean || agg === sum || throw(ArgumentError("agg must be `mean` or `sum`, got $agg"))
+    T = eltype(ŷ)
+    _native_float(T) || throw(ArgumentError("logitcrossentropy supports Float32 and Float64 logits, got $T"))
+    size(y) == size(ŷ) || throw(DimensionMismatch("targets of size $(size(y)) do not match logits of size $(size(ŷ))"))
+    c = ndims(ŷ) == 0 ? 1 : size(ŷ, 1)
+    m = length(ŷ) ÷ max(c, 1)
+    scale = agg === sum ? 1.0 : 1.0 / m
+    h = ndims(ŷ) == 2 ? ŷ : reshape(ŷ, (c, m))
+    if y isa _ADTensor
+        _same_graph(ŷ, y)
+        eltype(y) === T || throw(ArgumentError("targets must have the element type $T of the logits, got $(eltype(y))"))
+        t = ndims(y) == 2 ? y : reshape(y, (c, m))
+    else
+        t = _constant_tensor(ŷ, reshape(convert(AbstractArray{T}, y), (c, m)))
+    end
+    id = _bridge(ŷ, RustCrate.xent_node, RustCrate.traced_xent_node, UInt(h.id), UInt(t.id), Float64(scale))
+    loss = _wrap(ŷ, T, id, ())
+    return loss isa EagerTensor ? _scalar_result(loss) : loss
+end
