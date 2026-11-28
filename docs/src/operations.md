@@ -58,20 +58,53 @@ these discontinuities as a gradient reference.
 
 ## Element-type casts and constants
 
-`S.(x)` casts a tensor to any tensor element type `S` (`Float32`, `Float64`,
+`S.(x)` converts a tensor to any tensor element type `S` (`Float32`, `Float64`,
 `ComplexF32`, `ComplexF64`, `Int32`, `Int64`, `Bool`) with the tenferro-rs
-`cast`, in both directions, for example `Float32.(x)` of a `Float64` tensor,
-`ComplexF64.(x)` of a real tensor, or `Float32.(x .> 0)` of a mask; `float.(x)`
-casts to the floating-point type of `eltype(x)`. Casts between floating-point and
-complex types are differentiable: cotangents are cast back to the input type.
-Casts to or from integer and `Bool` types carry no derivative. Floating-point
-values cast to integers truncate toward zero, any nonzero value casts to
-`true`, and integer narrowing wraps, unlike Julia's `InexactError`. A complex
-tensor cannot be cast to a real type, which would drop the imaginary part
-(Julia throws `InexactError` when it is nonzero); `real.(z)` and `imag.(z)`
-project it differentiably. `convert(EagerTensor{Float32}, x)` (and likewise for
-`TracedTensor`) is the same cast and returns `x` itself when it already has the
-requested type. Mixed-type arithmetic uses the same cast for promotion.
+`cast`, for example `Float32.(x)` of a `Float64` tensor, `ComplexF64.(x)` of a
+real tensor, or `Float32.(x .> 0)` of a mask; `float.(x)` casts to the
+floating-point type of `eltype(x)`. `convert(EagerTensor{S}, x)` (and likewise
+for `TracedTensor`) is the same conversion and returns `x` itself when it
+already has the requested type. Casts between floating-point and complex types
+are differentiable: cotangents are cast back to the input type. Casts to or from
+integer and `Bool` types carry no derivative.
+
+Conversions follow Julia's `S(v)` for each element:
+
+- Conversions that are exact for every value of the source type always
+  succeed: to floating-point and complex types from real types (rounding to
+  nearest, as `Float32(v)` does), from `Bool`, and from `Int32` to `Int64`.
+- Conversions that depend on the values (a floating-point or complex value to an
+  integer type, `Int64` to `Int32`, anything but `Bool` to `Bool`, and complex to
+  real) check every element of an eager tensor and throw Julia's
+  `InexactError` when one is not exactly representable: `Int64.(x)` throws for
+  `2.7`, `NaN` or `2.0^63`, `Bool.(x)` for anything but 0 and 1, `Int32.(x)` for
+  `2^40`, and `Float64.(z)` for a nonzero imaginary part. The check costs one
+  read of the tensor back to the host.
+- On a `TracedTensor` the values are only computed when the graph is evaluated,
+  so these value-dependent conversions throw an `ArgumentError` instead. Use an
+  explicit rounding (`trunc.(Int64, x)`, `round.(Int64, x)`, `floor.(Int64, x)`
+  or `ceil.(Int64, x)`), `x .!= 0` for `Bool`, `x .% Int32` to wrap integers,
+  or `real.(z)` and `imag.(z)` for complex tensors.
+
+`trunc.(x)`, `floor.(x)`, `ceil.(x)` and `round.(x)` (ties to even, as in Julia;
+`round.(x, mode)` also accepts `RoundNearestTiesAway`, `RoundNearestTiesUp`,
+`RoundToZero`, `RoundFromZero`, `RoundUp` and `RoundDown`) round real
+floating-point tensors and keep their element type, `NaN`, infinities and the
+sign of zero. Their derivative is zero (for magnitudes of `2^62` and above,
+where every float is already an integer, it is zero up to rounding in the
+accumulated cotangent). Integer tensors round to themselves.
+They are composed from casts, comparisons and selections, so they cost more than
+one elementwise operation.
+
+`trunc.(S, x)`, `floor.(S, x)`, `ceil.(S, x)`, `round.(S, x)` and
+`round.(S, x, mode)` for `S` in `Int32`, `Int64` and `Bool` round and then
+convert. On an eager tensor a value whose rounding is out of range for `S`, or
+is `NaN` or infinite, throws the same `InexactError` as Julia. On a traced
+tensor the backend cast reports such values as an error when the graph is
+evaluated; a `Bool` target is rejected with an `ArgumentError`. An integer
+tensor converts exactly, as `S.(x)` does. `x .% S` for an integer tensor `x` and
+`S` in `Int32` or `Int64` wraps like Julia's `rem(v, S)` on both kinds of
+tensor. Mixed-type arithmetic promotes with the raw cast, which only widens.
 
 `Tenferro.context(x)` returns the `EagerContext` or `TracedContext` that owns
 `x`, and `Tenferro.constant(x, array)` copies a Julia array or number into it as
@@ -215,9 +248,10 @@ Julia-compatible contract.
 `Bool` tensors reduce like Julia's: `sum(mask)` and `count(mask)` (also
 `count(f, x)`) return `Int64` counts, `mean(mask)` and the mean of an integer
 tensor are `Float64`, and `any(mask)`, `all(mask)`, `any(f, x)` and `all(f, x)`
-return `Bool`, all with optional `dims`. Without `dims` the eager result is a
-scalar tensor, not a Julia number: use `only(any(mask))` or `Bool(any(mask))` to
-branch on it. A traced result is a zero-dimensional traced tensor.
+return `Bool`, all with optional `dims`. Without `dims`, `any` and `all` return a
+zero-dimensional `Bool` tensor (an eager scalar or a zero-dimensional traced
+tensor), not a Julia `Bool`, so convert it with `only(any(mask))` or
+`Bool(any(mask))` before using it in `if` or `&&`.
 
 ## Shapes, indexing, and ownership
 

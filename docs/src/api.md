@@ -17,6 +17,12 @@ constant
 context
 ```
 
+Element-type conversion and rounding use Base's functions on tensors: `S.(x)`,
+`convert(EagerTensor{S}, x)`, `float.`, `real.`, `imag.`, `trunc.`, `floor.`,
+`ceil.`, `round.` (also `round.(S, x, mode)`) and `x .% S`. Value-dependent
+conversions throw `InexactError` on eager tensors and `ArgumentError` on traced
+tensors; see [Element-type casts and constants](operations.md#Element-type-casts-and-constants).
+
 The NNlib, SpecialFunctions and ChainRulesCore package extensions add methods
 to those packages' functions and export no names of their own; see
 [Operation contracts](operations.md#Neural-network-operations).

@@ -30,31 +30,64 @@ end
 
 # Element-type casts --------------------------------------------------------------
 
+# Raw backend cast, used internally where the conversion is known to be exact or
+# the backend behaviour is wanted: float -> int truncates toward zero, integer
+# narrowing wraps, and any nonzero value becomes `true`.
 function _cast(a::_ADTensor, ::Type{S}) where {S<:TensorElement}
     eltype(a) === S && return a
     id = _bridge(a, RustCrate.cast_node, RustCrate.traced_cast_node, UInt(a.id), _typed_kind(S))
     _wrap(a, S, id, a.dims)
 end
 
-# Julia's `Float64(z)` throws for a complex `z` with a nonzero imaginary part;
-# an implicit projection would silently drop it (and its derivative).
-function _check_cast(::Type{T}, ::Type{S}) where {T,S}
-    T <: Complex && !(S <: Complex) &&
-        throw(ArgumentError("casting $T tensors to $S would drop the imaginary part; use real.(x) or imag.(x)"))
+# Whether every value of type `T` is exactly representable as `S`, so that the
+# cast needs no value check. Casts to floating-point and complex types round to
+# nearest, as Julia's `Float32(x)` does, so they count as exact here.
+_exact_cast(::Type{T}, ::Type{S}) where {T,S} =
+    T === S || T === Bool || (T === Int32 && S === Int64) || (S <: Complex) ||
+    (S <: AbstractFloat && !(T <: Complex))
+
+# Run Julia's own conversion `f(v)` on every element read back from `a`, so that
+# a value that is not representable throws the same `InexactError` as Julia.
+function _check_values(f::F, a::EagerTensor) where {F}
+    foreach(f, Array(a))
     return nothing
 end
 
-# `S.(x)` casts to any tensor element type. Casts between floating-point and
-# complex types are differentiable; casts to or from integer and `Bool` types are
-# not. Floating-point values cast to integers truncate toward zero, and any
-# nonzero value casts to `true`.
-function _B.broadcasted(::Type{S}, a::_ADTensor) where {S<:TensorElement}
-    _check_cast(eltype(a), S)
+function _traced_cast_error(::Type{T}, ::Type{S}) where {T,S}
+    hint = if T <: Complex && !(S <: Complex)
+        "use real.(x) or imag.(x)"
+    elseif S === Bool
+        "use x .!= 0"
+    elseif T <: Integer
+        "use x .% $S to wrap"
+    else
+        "use trunc.($S, x), round.($S, x), floor.($S, x) or ceil.($S, x)"
+    end
+    throw(ArgumentError("exact conversion of a TracedTensor{$T} to $S is not available: it can throw " *
+                        "InexactError depending on values, which a traced graph only computes when it is " *
+                        "evaluated; $hint"))
+end
+
+# `S.(x)` follows Julia's exact conversion `S(v)`: on eager tensors a value that
+# is not representable in `S` (a fractional or out-of-range value cast to an
+# integer, a `Bool` from anything but 0 or 1, a complex value with a nonzero
+# imaginary part cast to a real type) throws `InexactError`.
+_exact_convert(a::_ADTensor, ::Type{S}) where {S} =
+    _exact_cast(eltype(a), S) ? _cast(a, S) : _checked_cast(a, S)
+function _checked_cast(a::EagerTensor, ::Type{S}) where {S}
+    _check_values(S, a)
     _cast(a, S)
 end
+_checked_cast(a::TracedTensor, ::Type{S}) where {S} = _traced_cast_error(eltype(a), S)
+
+_B.broadcasted(::Type{S}, a::_ADTensor) where {S<:TensorElement} = _exact_convert(a, S)
 _B.broadcasted(::Type{S}, s::EagerScalar) where {S<:TensorElement} =
     _scalar_result(_B.broadcasted(S, _scalar_tensor_value(s)))
 _B.broadcasted(::typeof(float), a::_ADTensor) = _cast(a, float(eltype(a)))
+
+# `x .% S` wraps integers to the integer type `S`, as Julia's `rem(v, S)`.
+_B.broadcasted(::typeof(rem), a::Union{EagerTensor{<:Integer},TracedTensor{<:Integer}},
+                ::Type{S}) where {S<:Union{Int32,Int64}} = _cast(a, S)
 
 function _B.broadcasted(::typeof(real), a::_ADTensor)
     eltype(a) <: Complex || return a
@@ -80,6 +113,85 @@ end
 
 # Promotions (e.g. `Float32` with `Float64`) go through the same explicit cast.
 _convert_tensor(a::_ADTensor, ::Type{S}) where {S<:ADElement} = _cast(a, S)
+
+# Rounding ------------------------------------------------------------------------
+
+const _RoundingModes = Union{typeof(RoundNearest),typeof(RoundNearestTiesAway),typeof(RoundNearestTiesUp),
+                             typeof(RoundToZero),typeof(RoundFromZero),typeof(RoundUp),typeof(RoundDown)}
+
+# `trunc` without a derivative path. Values below 2^62 in magnitude go through an
+# `Int64` cast, which is exact there (larger floats are already integers) and
+# carries no derivative; zeros keep the sign of `x`. Larger values and
+# infinities use `x - rem(x, 1)`, which equals `x` and whose derivative `1 - 1`
+# cancels (up to rounding in the accumulated cotangent).
+function _trunc(x::_ADTensor)
+    T = eltype(x)
+    small = _B.broadcasted(<, _B.broadcasted(abs, x), T(2.0^62))
+    t = _cast(_cast(_select(small, x, zero(T)), Int64), T)
+    t = _select(_B.broadcasted(==, t, zero(T)), _B.broadcasted(*, x, zero(T)), t)
+    large = _B.broadcasted(-, x, _B.broadcasted(rem, x, one(T)))
+    large = _select(_B.broadcasted(==, _B.broadcasted(abs, x), T(Inf)), x, large)
+    _select(small, t, large)
+end
+
+# Round from the truncation `t`: step one away from zero (`t + sign(x)`) where
+# the mode asks for it. Every step is a function of comparisons, so the result
+# carries a zero derivative.
+function _round(x::_ADTensor, mode::_RoundingModes)
+    T = eltype(x)
+    T <: Integer && return x
+    T <: Complex && throw(ArgumentError("rounding $T tensors is not supported; round real.(z) and imag.(z)"))
+    t = _trunc(x)
+    mode === RoundToZero && return t
+    mode === RoundDown && return _select(_B.broadcasted(>, t, x), _B.broadcasted(-, t, one(T)), t)
+    mode === RoundUp && return _select(_B.broadcasted(<, t, x), _B.broadcasted(+, t, one(T)), t)
+    d = _B.broadcasted(abs, _B.broadcasted(-, x, t))
+    away = if mode === RoundFromZero
+        _B.broadcasted(>, d, zero(T))
+    else
+        tie = if mode === RoundNearest  # ties to even: step when `t` is odd
+            _B.broadcasted(!=, _B.broadcasted(rem, _B.broadcasted(*, t, T(0.5)), one(T)), zero(T))
+        elseif mode === RoundNearestTiesAway
+            true
+        else  # RoundNearestTiesUp
+            _B.broadcasted(>, x, zero(T))
+        end
+        _select(_B.broadcasted(==, d, T(0.5)), tie, _B.broadcasted(>, d, T(0.5)))
+    end
+    _select(away, _B.broadcasted(+, t, _B.broadcasted(sign, x)), t)
+end
+
+# `round(S, x)` for an integer type `S`: round in floating point, then convert.
+# On eager tensors Julia's own `f(S, v)` checks every value first, so NaN, Inf
+# and out-of-range values throw its `InexactError`. Traced tensors use the
+# backend cast, which rejects non-finite and out-of-range values when the graph
+# is evaluated. An integer source converts exactly, as `S.(x)`.
+function _round(::Type{S}, x::_ADTensor, mode::_RoundingModes, f::F) where {S,F}
+    S <: Union{Int32,Int64,Bool} || throw(ArgumentError("rounding to $S is not supported; use Int32, Int64 or Bool"))
+    T = eltype(x)
+    T <: Integer && return _exact_convert(x, S)
+    T <: Complex && throw(ArgumentError("rounding $T tensors is not supported; round real.(z) and imag.(z)"))
+    if x isa EagerTensor
+        _check_values(v -> f(S, v), x)
+    elseif S === Bool
+        throw(ArgumentError("rounding a TracedTensor to Bool is not available: it can throw InexactError " *
+                            "depending on values; use x .!= 0 or compare the rounded values"))
+    end
+    _cast(_round(x, mode), S)
+end
+
+for (fn, mode) in ((:trunc, RoundToZero), (:floor, RoundDown), (:ceil, RoundUp), (:round, RoundNearest))
+    @eval begin
+        _B.broadcasted(::typeof($fn), a::_ADTensor) = _round(a, $mode)
+        _B.broadcasted(::typeof($fn), ::Type{S}, a::_ADTensor) where {S<:Integer} = _round(S, a, $mode, $fn)
+        _B.broadcasted(::typeof($fn), s::EagerScalar) = _scalar_result(_round(_scalar_tensor_value(s), $mode))
+        _B.broadcasted(::typeof($fn), ::Type{S}, s::EagerScalar) where {S<:Integer} =
+            _scalar_result(_round(S, _scalar_tensor_value(s), $mode, $fn))
+    end
+end
+_B.broadcasted(::typeof(round), a::_ADTensor, mode::_RoundingModes) = _round(a, mode)
+_B.broadcasted(::typeof(round), ::Type{S}, a::_ADTensor, mode::_RoundingModes) where {S<:Integer} =
+    _round(S, a, mode, (S, v) -> round(S, v, mode))
 
 # Arithmetic between traced scalars (eager scalars have their own methods); `+`
 # and `-` are shared with tensors of any rank.
