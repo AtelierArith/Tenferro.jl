@@ -59,27 +59,41 @@ _output_size(y::_ADTensor) = y.dims
 _value(y::EagerScalar) = y[]
 _value(y::_ADTensor) = isempty(y.dims) ? only(Array(y)) : Array(y)
 
-_seed(ctx::EagerContext, value::AbstractArray) = EagerTensor(ctx, value)
+_seed(ctx::EagerContext, value::AbstractArray) = _eager_constant(ctx.graph, value)
 _seed(ctx::TracedContext, value::AbstractArray) = TracedTensor(ctx, value)
 
 _derivative_tensor(ctx::EagerContext, ::Type{T}, id, dims) where {T} = EagerTensor{T,length(dims),typeof(ctx.graph)}(ctx.graph, id, dims)
 _derivative_tensor(ctx::TracedContext, ::Type{T}, id, dims) where {T} = TracedTensor{T,length(dims),typeof(ctx.graph)}(ctx.graph, id, dims)
 
-_reverse_id(ctx::EagerContext, output, input, seed) =
-    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.vjp_node, UInt(output.id), UInt(input.id), UInt(seed.id)))
-_reverse_id(ctx::TracedContext, output, input, seed) =
-    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_derivative, UInt(output.id), UInt(input.id), UInt(seed.id), false))
 _forward_id(ctx::EagerContext, output, input, seed) =
     RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.jvp_node, UInt(output.id), UInt(input.id), UInt(seed.id)))
 _forward_id(ctx::TracedContext, output, input, seed) =
     RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_derivative, UInt(output.id), UInt(input.id), UInt(seed.id), true))
 
-# Reverse-mode derivative of `output` with respect to one input leaf.
-function _reverse(ctx, output, input, seed)
-    id = _reverse_id(ctx, output, input, seed)
-    id == -2 && return zeros(eltype(input), input.dims)
-    id >= 0 || error("tenferro-rs reverse-mode derivative failed")
-    Array(_derivative_tensor(ctx, eltype(input), id, input.dims))
+_reverse_ids!(ids, ctx::EagerContext, output, leaves, seed) =
+    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.vjp_nodes, UInt(output.id), UInt[leaf.id for leaf in leaves], UInt(seed.id), ids))
+_reverse_ids!(ids, ctx::TracedContext, output, leaves, seed) =
+    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_vjp_nodes, UInt(output.id), UInt[leaf.id for leaf in leaves], UInt(seed.id), ids))
+
+# Traced values are computed together: one compiled program for the value and all derivatives.
+_evaluate(::EagerContext, nodes) = nothing
+_evaluate(ctx::TracedContext, nodes) =
+    RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.traced_evaluate, UInt.(nodes)))
+
+# Reverse-mode derivatives of `output` with respect to every tensor leaf of `inputs`, from
+# one reverse pass; the result keeps the structure of `inputs`.
+function _reverse(ctx, output, inputs, seed, want_value::Bool)
+    leaves = _tensor_leaves(inputs)
+    ids = zeros(Int64, length(leaves))
+    isempty(leaves) || _reverse_ids!(ids, ctx, output, leaves, seed)
+    all(id -> id >= 0 || id == -2, ids) || error("tenferro-rs reverse-mode derivative failed")
+    _evaluate(ctx, [want_value ? [output.id] : Int64[]; filter(>=(0), ids)])
+    grads = Dict{Int64,Any}()
+    for (leaf, id) in zip(leaves, ids)
+        grads[leaf.id] = id == -2 ? zeros(eltype(leaf), leaf.dims) :
+            Array(_derivative_tensor(ctx, eltype(leaf), id, leaf.dims))
+    end
+    return _tree_map(input -> grads[input.id]::Array{eltype(input),length(input.dims)}, inputs)
 end
 
 # Forward-mode derivative; `nothing` when the output does not depend on `input`.
@@ -94,8 +108,8 @@ function _gradient(backend::_Backend, f::F, x, contexts, want_value::Bool) where
     ctx, inputs, output = _record(backend, f, x, contexts)
     _is_scalar(output) || throw(ArgumentError("gradient requires a scalar output"))
     seed = _seed(ctx, fill(one(eltype(output))))
-    value = want_value ? _value(output) : nothing
-    return value, _tree_map(input -> _reverse(ctx, output, input, seed), inputs)
+    grads = _reverse(ctx, output, inputs, seed, want_value)
+    return (want_value ? _value(output) : nothing), grads
 end
 
 function _check_seed(output, seed::AbstractArray)
@@ -114,8 +128,7 @@ _check_seed(output, seed) = throw(ArgumentError("seed must be a supported array 
 function _pullback(backend::_Backend, f::F, x, seeds::Tuple, contexts, want_value::Bool) where {F}
     ctx, inputs, output = _record(backend, f, x, contexts)
     grads = map(seeds) do seed
-        s = _seed(ctx, _check_seed(output, seed))
-        _tree_map(input -> _reverse(ctx, output, input, s), inputs)
+        _reverse(ctx, output, inputs, _seed(ctx, _check_seed(output, seed)), want_value)
     end
     return (want_value ? _value(output) : nothing), grads
 end

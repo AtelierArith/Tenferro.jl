@@ -78,14 +78,16 @@ Arbitrary Julia functions are supported only when their tensor operations are su
 
 All tenferro-rs operations of a process run on one shared CPU engine, which keeps its buffer pool and kernel plan cache between calls. The engine is serial by default. Set `TENFERRO_NUM_THREADS=n` before the first operation, or call `Tenferro.set_num_threads(n)`, to run kernels on `n` worker threads. `Tenferro.num_threads()` reports the current count. Threaded kernels may round differently from serial ones.
 
-Medians for one MNIST training step (`TenferroLux.withgradient`, batch 128, Float32; the MLP is 784→128→64→10, the CNN has two conv/max-pool layers):
+All eager contexts share one runtime whose compiled derivative programs persist across calls (bounded by tenferro-ad's cache limits), and gradients for all inputs come from one reverse pass. Repeated `gradient` calls on the same computation and shapes therefore compile it only once.
 
-| Step | before | shared engine, serial | 4 threads | Zygote |
+Medians for one MNIST training step (`TenferroLux.withgradient`, batch 128, Float32; the MLP is 784→128→64→10, the CNN has two conv/max-pool layers), with bitwise identical results:
+
+| Step | before (44aac49) | now, serial | 4 threads | Zygote |
 |:--|--:|--:|--:|--:|
-| MLP, `AutoTenferro` | 38.7 ms | 23.1 ms | 24.3 ms | 2.2 ms |
-| MLP, `AutoTenferroTraced` | 19.1 ms | 21.0 ms | 19.4 ms | |
-| CNN, `AutoTenferro` | 265 ms | 202 ms | 162 ms | 31 ms |
-| CNN, `AutoTenferroTraced` | 274 ms | 205 ms | 115 ms | |
+| MLP, `AutoTenferro` | 24.9 ms | 3.3 ms | 3.4 ms | 0.65 ms |
+| MLP, `AutoTenferroTraced` | 23.1 ms | 4.9 ms | 4.4 ms | |
+| CNN, `AutoTenferro` | 246 ms | 71 ms | 47 ms | 30 ms |
+| CNN, `AutoTenferroTraced` | 273 ms | 71 ms | 41 ms | |
 
 See the [performance guide](docs/src/performance.md) for micro benchmarks and the cost of each call.
 
