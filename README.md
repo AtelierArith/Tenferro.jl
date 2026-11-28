@@ -55,9 +55,20 @@ y = [2.0 0.0; 0.0 3.0]
 gx, gy = gradient(args -> sum(f(args...)), AutoTenferro(), (x, y))
 ```
 
+`value_and_gradient`, `value_and_pullback` and `value_and_pushforward` also return the primal value, DifferentiationInterface `Constant` arguments are passed through undifferentiated, and the active input may be a nested `Tuple`/`NamedTuple` parameter tree (gradients keep its structure):
+
+```julia
+ps = (weight = [1.0 2.0; 3.0 4.0], bias = [0.5, -1.0])
+loss(p, x) = sum(abs2.(p.weight * x .+ p.bias))
+value, g = value_and_gradient(loss, AutoTenferro(), ps, Constant([1.0, 2.0]))
+# g.weight, g.bias
+```
+
+Use `Tenferro.stopgrad(x)` (or `ChainRulesCore.ignore_derivatives(x)`) to block gradient flow. Scalar results are read with `s[]`, `only(s)` or `Float64(s)`.
+
 Seeds and tangents must match the corresponding value's shape and element type. Complex cotangents use the real Hermitian inner-product convention; a complex scalar gradient is a VJP with seed `one(eltype(output))`. See the [autodiff guide](docs/src/autodiff.md) for details.
 
-Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, elementwise mathematical functions, reductions, shape and slicing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations.
+Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, comparisons and `ifelse` selection, elementwise mathematical functions, reductions (including `var`/`std`), shape, concatenation, slicing and integer-vector indexing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations.
 
 Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. General Julia broadcast functions, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
 

@@ -49,6 +49,17 @@ discontinuities; its divisor must be nonzero. Complex `sign` uses the real
 derivative of `z / abs(z)` away from zero. Do not use finite differences across
 these discontinuities as a gradient reference.
 
+## Comparisons and selection
+
+`.==`, `.!=`, `.<`, `.<=`, `.>` and `.>=` compare tensors, scalars and constant
+Julia arrays with the broadcast and promotion rules above and return `Bool`
+tensors. Comparisons are not differentiable: no cotangent flows through them.
+`.!` negates a `Bool` tensor. `ifelse.(mask, a, b)` selects elementwise; the
+mask may be a `Bool` tensor, a `Bool` array or a `Bool`, and the branches may
+be tensors, scalars or constant arrays of a common promoted type. Cotangents
+flow into the selected branch only. `abs2.(x)` and `inv.(x)` are composed from
+the supported arithmetic operations.
+
 ## Elementwise mathematical functions
 
 The eight supported broadcast functions call the corresponding Rust operations:
@@ -83,6 +94,8 @@ surface; no SpecialFunctions dependency or extension is installed.
 ## Reductions
 
 `sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean` accept `dims`.
+`Statistics.var` and `Statistics.std` accept `dims`, `corrected` and a
+precomputed `mean`; they are composed from `mean`, `abs2` and `sum`.
 Without `dims`, they reduce all elements to a scalar. With `dims`, Julia
 dimensions are converted from one-based to zero-based Rust axes; reduced
 dimensions are restored with extent one. Tuples of axes may be unordered.
@@ -120,16 +133,19 @@ pullback conjugates the seed; `transpose` does not conjugate. Higher-rank
 `transpose` is rejected; use `permutedims` instead.
 
 `reverse` accepts one dimension or a tuple of dimensions. `cat` accepts one
-existing dimension, requires equal extents on every other axis, and promotes
-floating-point/complex types. New dimensions and block concatenation tuples
-are not exposed.
+positive dimension; lower-rank operands get trailing singleton dimensions, so
+`cat(a, b; dims=3)` of matrices or `hcat` of vectors works as in Julia.
+Every other axis must have equal extents; floating-point/complex types are
+promoted. `vcat` and `hcat` of tensors are `cat` along dimensions 1 and 2.
+Block concatenation tuples are not exposed. `dropdims`, `selectdim`, and
+`eachslice` (returning a Julia array of tensor slices, with `drop`) follow Base.
 
-Indexing supports one integer, nonempty positive-step integer range, or `:`
-per dimension. Integer dimensions are dropped. Vectors additionally support
-integer index vectors and Boolean masks; repeated indices accumulate their
-cotangents. Empty ranges and negative steps are explicitly rejected. General
-linear indexing of matrices, Cartesian index arrays, `view`, `setindex!`, and
-arbitrary mixed advanced indexing are not exposed. `tril`, `triu`, and
+Indexing supports one integer, nonempty positive-step integer range, `:`,
+nonempty integer vector, or Boolean mask per dimension, for example
+`W[:, [1, 3, 3]]`. Integer dimensions are dropped. Integer vectors gather along
+their dimension; repeated indices accumulate their cotangents. Empty ranges
+and negative steps are explicitly rejected; `A[:]` flattens. Linear indexing
+of matrices, Cartesian index arrays, `view`, and `setindex!` are not exposed. `tril`, `triu`, and
 nonempty `diag` use Julia's signed diagonal offsets.
 
 Input construction and `Array(tensor)` each copy data. Raw Julia pointers are

@@ -125,6 +125,34 @@ fn copy_tensor(value: &Tensor, out: &mut [u8], kind: i32) -> FfiResult<()> {
     }
 }
 
+fn compare_dir(code: i32) -> FfiResult<tenferro_ad::CompareDir> {
+    Ok(match code {
+        0 => tenferro_ad::CompareDir::Eq,
+        1 => tenferro_ad::CompareDir::Lt,
+        2 => tenferro_ad::CompareDir::Le,
+        3 => tenferro_ad::CompareDir::Gt,
+        4 => tenferro_ad::CompareDir::Ge,
+        _ => return Err("unsupported comparison".into()),
+    })
+}
+
+/// Gather whole slices of `shape` along `axis` using an `(m, 1)` index tensor.
+/// The gathered axis keeps its position in the output.
+fn gather_axis_config(shape: &[usize], axis: usize) -> FfiResult<tenferro_ad::GatherConfig> {
+    if axis >= shape.len() {
+        return Err("gather axis out of range".into());
+    }
+    let mut slice_sizes = shape.to_vec();
+    slice_sizes[axis] = 1;
+    Ok(tenferro_ad::GatherConfig {
+        offset_dims: (0..shape.len()).filter(|&d| d != axis).collect(),
+        collapsed_slice_dims: vec![axis],
+        start_index_map: vec![axis],
+        index_vector_dim: 1,
+        slice_sizes,
+    })
+}
+
 #[julia]
 pub struct EagerGraph {
     ctx: Option<std::sync::Arc<EagerRuntime>>,
@@ -292,23 +320,67 @@ impl EagerGraph {
     }
 
     #[julia]
-    pub fn gather_vector(&mut self, input: usize, indices: usize) -> Result<i64, String> {
+    pub fn gather_axis(&mut self, input: usize, indices: usize, axis: usize) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let ix = self.nodes.get(indices).ok_or("invalid indices")?;
-            let config = tenferro_ad::GatherConfig {
-                offset_dims: vec![],
-                collapsed_slice_dims: vec![0],
-                start_index_map: vec![0],
-                index_vector_dim: 1,
-                slice_sizes: vec![1],
-            };
+            let config = gather_axis_config(x.shape(), axis)?;
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
                     s.gather(x, ix, config)
                 })?,
             )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn compare_node(&mut self, lhs: usize, rhs: usize, dir: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            let dir = compare_dir(dir)?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.compare(a, b, dir)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn select_node(
+        &mut self,
+        condition: usize,
+        on_true: usize,
+        on_false: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let c = self.nodes.get(condition).ok_or("invalid condition")?;
+            let t = self.nodes.get(on_true).ok_or("invalid true branch")?;
+            let f = self.nodes.get(on_false).ok_or("invalid false branch")?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.where_select(c, t, f)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn detach_node(&mut self, input: usize) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(input).ok_or("invalid input")?;
+            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| s.detach(x))?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -711,18 +783,45 @@ impl TracedGraph {
     }
 
     #[julia]
-    pub fn traced_gather_vector(&mut self, input: usize, indices: usize) -> Result<i64, String> {
+    pub fn traced_gather_axis(
+        &mut self,
+        input: usize,
+        indices: usize,
+        axis: usize,
+    ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let ix = self.nodes.get(indices).ok_or("invalid indices")?;
-            let config = tenferro_runtime::GatherConfig {
-                offset_dims: vec![],
-                collapsed_slice_dims: vec![0],
-                start_index_map: vec![0],
-                index_vector_dim: 1,
-                slice_sizes: vec![1],
-            };
-            Ok(x.gather(ix, config)?)
+            let shape = x.try_concrete_shape().ok_or("gather requires a concrete shape")?;
+            Ok(x.gather(ix, gather_axis_config(&shape, axis)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_compare_node(&mut self, lhs: usize, rhs: usize, dir: i32) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
+            let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
+            Ok(a.compare(b, compare_dir(dir)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_select_node(
+        &mut self,
+        condition: usize,
+        on_true: usize,
+        on_false: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let c = self.nodes.get(condition).ok_or("invalid condition")?;
+            let t = self.nodes.get(on_true).ok_or("invalid true branch")?;
+            let f = self.nodes.get(on_false).ok_or("invalid false branch")?;
+            Ok(tenferro_runtime::TracedTensor::where_select(c, t, f)?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
