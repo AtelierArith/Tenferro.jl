@@ -134,3 +134,10 @@ julia --project=docs docs/make.jl
 ```
 
 Serve `docs/build/1` over HTTP to preview the generated site.
+
+CI publishes the documentation to the `gh-pages` branch after tests and the
+documentation build pass on `main`. The [development documentation](https://atelierarith.github.io/Tenferro.jl/dev/)
+tracks `main`; pull requests only build the documentation. In **Settings → Pages**,
+select **Deploy from a branch**, branch **gh-pages**, and folder **/ (root)**.
+Deployment authenticates with the repository's `DOCUMENTER_KEY` secret and its
+write-enabled deploy key so each push triggers a Pages update.
