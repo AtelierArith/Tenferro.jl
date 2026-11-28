@@ -2,7 +2,7 @@
 
 julia_version = "1.13.4"
 manifest_format = "2.1"
-project_hash = "a704a4722d6e75e7d74f3cd736236cf1fb9cf8f5"
+project_hash = "a0f872d11595720f937d861f2d90e60e83dd6649"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -344,6 +344,13 @@ version = "2.33.0"
     BlockBandedMatrices = "ffab5731-97b5-5995-9138-79e8c1846df0"
     SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
     StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[[deps.Functors]]
+deps = ["Compat", "ConstructionBase", "LinearAlgebra", "PrecompileTools", "Random"]
+git-tree-sha1 = "6a973ab88e731b59155f1af499e8f0a88e962c7c"
+registries = "General"
+uuid = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
+version = "0.5.5"
 
 [[deps.Future]]
 deps = ["Random"]
@@ -1011,10 +1018,11 @@ deps = ["ADTypes", "DifferentiationInterface", "LinearAlgebra", "RustCall", "Sta
 path = "."
 uuid = "d33ea9cf-7ee9-48af-8625-0ce6eefcc2e6"
 version = "0.1.0"
-weakdeps = ["ChainRulesCore", "NNlib", "SpecialFunctions"]
+weakdeps = ["ChainRulesCore", "Functors", "NNlib", "SpecialFunctions"]
 
     [deps.Tenferro.extensions]
     TenferroChainRulesCoreExt = "ChainRulesCore"
+    TenferroFunctorsExt = "Functors"
     TenferroNNlibExt = "NNlib"
     TenferroSpecialFunctionsExt = "SpecialFunctions"
 

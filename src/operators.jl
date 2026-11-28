@@ -118,17 +118,6 @@ function _broadcast_to(a::TracedTensor{T}, dims) where {T}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_broadcast_to, UInt(a.id), values))
     TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
-function _convert_tensor(a::EagerTensor{T,N}, ::Type{S}) where {T,N,S<:ADElement}
-    T === S && return a
-    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.convert_node, UInt(a.id), _typed_kind(S)))
-    EagerTensor{S,N,typeof(a.graph)}(a.graph, id, a.dims)
-end
-function _convert_tensor(a::TracedTensor{T,N}, ::Type{S}) where {T,N,S<:ADElement}
-    T === S && return a
-    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_convert_node, UInt(a.id), _typed_kind(S)))
-    TracedTensor{S,N,typeof(a.graph)}(a.graph, id, a.dims)
-end
-
 function _broadcast_pair(a::_ADTensor, b::_ADTensor)
     a.graph === b.graph || throw(ArgumentError("tensors belong to different contexts"))
     promoted = promote_type(eltype(a), eltype(b))
@@ -369,7 +358,6 @@ function _cat(first::_ADTensor, rest, dims)
     id = RustCall.result_to_exception(_rust_call(first.graph, fn, ids, UInt(dims - 1)))
     _factor_tensor(first, promoted, id, shape)
 end
-Base.cat(first::_ADTensor, rest::_ADTensor...; dims) = _cat(first, rest, dims)
 
 Base.Broadcast.broadcasted(::typeof(clamp), a::_ADTensor, lo::Union{_ADTensor,Number,AbstractArray}, hi::Union{_ADTensor,Number,AbstractArray}) = Base.Broadcast.broadcasted(min, Base.Broadcast.broadcasted(max, a, lo), hi)
 

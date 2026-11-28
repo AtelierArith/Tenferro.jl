@@ -1,7 +1,7 @@
 module TenferroNNlibExt
 
 using NNlib
-using Tenferro: Tenferro, EagerScalar, _ADTensor, _FloatTensor, _select, _scalar_result, _scalar_tensor_value
+using Tenferro: Tenferro, Statistics, EagerScalar, _ADTensor, _FloatTensor, _select, _scalar_result, _scalar_tensor_value
 
 const B = Base.Broadcast
 
@@ -215,5 +215,18 @@ function NNlib.upsample_linear(x::_ADTensor; size::Union{Integer,NTuple{<:Any,In
 end
 
 NNlib.pixel_shuffle(x::_ADTensor, r::Integer) = _P._pixel_shuffle(x, r)
+
+# Gather and scatter -----------------------------------------------------------------------
+
+NNlib.gather(src::_ADTensor, idx::AbstractArray; checkbounds::Bool=true) = _P._gather(src, idx)
+NNlib.gather(src::_ADTensor, I::AbstractVector{<:Integer}, J::AbstractVector{<:Integer},
+             Ks::AbstractVector{<:Integer}...; checkbounds::Bool=true) = _P._gather(src, CartesianIndex.(I, J, Ks...))
+
+for (op, name) in ((+, :+), (-, :-), (Statistics.mean, :mean))
+    @eval NNlib.scatter(::typeof($op), src::_ADTensor, idx::AbstractArray; init=nothing, dstsize=nothing,
+                        checkbounds::Bool=true) = _P._scatter($(QuoteNode(name)), src, idx, init, dstsize)
+end
+NNlib.scatter(op, src::_ADTensor, idx::AbstractArray; kwargs...) =
+    throw(ArgumentError("NNlib.scatter on Tenferro tensors supports +, - and mean, not $op"))
 
 end

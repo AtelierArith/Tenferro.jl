@@ -153,6 +153,30 @@ fn gather_axis_config(shape: &[usize], axis: usize) -> FfiResult<tenferro_ad::Ga
     })
 }
 
+/// Any tensor dtype, for explicit (possibly lossy) casts.
+fn any_dtype(kind: i32) -> FfiResult<tenferro_ad::DType> {
+    Ok(match kind {
+        2 => tenferro_ad::DType::I32,
+        3 => tenferro_ad::DType::I64,
+        6 => tenferro_ad::DType::Bool,
+        _ => float_dtype(kind)?,
+    })
+}
+
+/// Scatter-add whole slices along `axis`: `updates` has the operand's shape
+/// except along `axis`, where it has one entry per row of the `(m, 1)` indices.
+fn scatter_axis_config(rank: usize, axis: usize) -> FfiResult<tenferro_ad::ScatterConfig> {
+    if axis >= rank {
+        return Err("scatter axis out of range".into());
+    }
+    Ok(tenferro_ad::ScatterConfig {
+        update_window_dims: (0..rank).filter(|&d| d != axis).collect(),
+        inserted_window_dims: vec![axis],
+        scatter_dims_to_operand_dims: vec![axis],
+        index_vector_dim: 1,
+    })
+}
+
 /// Decode `[low..., high..., interior...]` padding amounts for a rank-`rank` tensor.
 fn pad_config(rank: usize, amounts: &[i64]) -> FfiResult<tenferro_ad::PadConfig> {
     if amounts.len() != 3 * rank {
@@ -334,14 +358,38 @@ impl EagerGraph {
     }
 
     #[julia]
-    pub fn convert_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
+    pub fn cast_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            let dtype = float_dtype(kind)?;
+            let dtype = any_dtype(kind)?;
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
-                    s.convert(x, dtype)
+                    s.cast(x, dtype)
+                })?,
+            )
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn scatter_add_axis(
+        &mut self,
+        operand: usize,
+        indices: usize,
+        updates: usize,
+        axis: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let x = self.nodes.get(operand).ok_or("invalid operand")?;
+            let ix = self.nodes.get(indices).ok_or("invalid indices")?;
+            let u = self.nodes.get(updates).ok_or("invalid updates")?;
+            let config = scatter_axis_config(x.shape().len(), axis)?;
+            Ok(
+                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                    s.scatter(x, ix, u, config)
                 })?,
             )
         })();
@@ -871,10 +919,29 @@ impl TracedGraph {
     }
 
     #[julia]
-    pub fn traced_convert_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
+    pub fn traced_cast_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            Ok(x.convert(float_dtype(kind)?)?)
+            Ok(x.cast(any_dtype(kind)?)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    #[julia]
+    pub fn traced_scatter_add_axis(
+        &mut self,
+        operand: usize,
+        indices: usize,
+        updates: usize,
+        axis: usize,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
+            let x = self.nodes.get(operand).ok_or("invalid operand")?;
+            let ix = self.nodes.get(indices).ok_or("invalid indices")?;
+            let u = self.nodes.get(updates).ok_or("invalid updates")?;
+            let rank = x.try_concrete_shape().ok_or("scatter requires a concrete shape")?.len();
+            Ok(x.scatter(ix, u, scatter_axis_config(rank, axis)?)?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))

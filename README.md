@@ -70,6 +70,8 @@ Seeds and tangents must match the corresponding value's shape and element type. 
 
 Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, comparisons and `ifelse` selection, elementwise mathematical functions, reductions (including `var`/`std`), shape, concatenation, slicing and integer-vector indexing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations.
 
+Element types are cast with broadcasting, as in `Float32.(x)` or `Float64.(x .> 0)` (differentiable between floating-point and complex types). Inside a differentiated function, `Tenferro.constant(x, array)` creates a constant tensor in the context of `x` (`Tenferro.context(x)` returns that context), and plain arrays can be mixed with tensors in arithmetic and in `cat`/`hcat`/`vcat`. `vec`, `repeat`, `sum(f, x; dims)`-style mapped reductions, `count`/`any`/`all` and sums of `Bool` tensors, n-ary `max.`/`min.`/`+`/`*`, and `muladd.`/`fma.` are also supported.
+
 Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. Broadcasting any other function, including an anonymous function, throws an `ArgumentError` naming it; `(f ∘ g).(x...)` is expanded to `f.(g.(x...))`. Prepared calls and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
 
 ## Tensor types
@@ -113,7 +115,8 @@ Loading NNlib.jl together with Tenferro activates the `TenferroNNlibExt` package
 - `pad_zeros` and `pad_constant`;
 - `conv` (stride, asymmetric padding, dilation, groups, `flipped`), `depthwiseconv`, `∇conv_data` (transposed convolution) and `∇conv_filter` with 1-3 spatial dimensions;
 - `maxpool` (gradients go to the first maximum of each window, like NNlib), `meanpool` and `lpnormpool` with `PoolDims` or keywords, including what Lux's global and adaptive pooling layers call;
-- `upsample_nearest`, `upsample_linear`/`upsample_bilinear`/`upsample_trilinear` (both `align_corners`) and `pixel_shuffle`.
+- `upsample_nearest`, `upsample_linear`/`upsample_bilinear`/`upsample_trilinear` (both `align_corners`) and `pixel_shuffle`;
+- `gather` and `scatter` (`+`, `-`, `mean`).
 
 ```julia
 using Tenferro, NNlib, DifferentiationInterface
@@ -131,9 +134,13 @@ g = gradient(cnn, AutoTenferroTraced(), randn(Float32, 3, 3, 1, 4))
 
 Normalization layers and dropout are not yet provided.
 
+## Optional Functors extension
+
+Loading Functors.jl activates `TenferroFunctorsExt`, which declares `EagerTensor`, `TracedTensor` and eager scalars as Functors.jl leaves, so `fmap` and `fleaves` over parameter trees (as Lux and Optimisers.jl use them) treat each tensor as one value.
+
 ## Tests and documentation
 
-Run the test suite with `julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'`. Tests use ParallelTestRunner, Aqua, JET, FiniteDiff, and NNlib.
+Run the test suite with `julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'`. Tests use ParallelTestRunner, Aqua, JET, FiniteDiff, NNlib, and Functors.
 
 Build the DocumenterVitepress documentation locally with:
 
