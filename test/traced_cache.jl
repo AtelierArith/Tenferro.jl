@@ -70,3 +70,21 @@ end
         @test gradient(conv_loss, TRACED, x) ≈ gradient(conv_loss, AutoTenferro(), x)
     end
 end
+
+@testset "repeated traced graphs reuse their reverse pass and program, on new data" begin
+    loss(p, x) = sum(abs2.(relu.(p.W * x .+ p.b)))
+    for k in 1:4
+        W, b, x = sin.(k .* [1.0 2.0 3.0; 4.0 5.0 6.0]), cos.(k .* [1.0, 2.0]), tan.(k .* [0.1, 0.2, 0.3])
+        v, g = value_and_gradient(loss, TRACED, (; W, b), Constant(x))
+        ev, eg = value_and_gradient(loss, AutoTenferro(), (; W, b), Constant(x))
+        @test v ≈ ev && g.W ≈ eg.W && g.b ≈ eg.b
+        # Seeds and tangents are data of each call as well.
+        seeds = (k * 1.0, -2.0k)
+        t = value_and_pullback(loss, TRACED, (; W, b), seeds, Constant(x))
+        e = value_and_pullback(loss, AutoTenferro(), (; W, b), seeds, Constant(x))
+        @test t[1] ≈ e[1]
+        @test all(i -> t[2][i].W ≈ e[2][i].W && t[2][i].b ≈ e[2][i].b, 1:2)
+        f(v) = sum(abs2.(v .* x))
+        @test pushforward(f, TRACED, x, (k .* x,))[1] ≈ pushforward(f, AutoTenferro(), x, (k .* x,))[1]
+    end
+end
