@@ -86,6 +86,11 @@ function _lift(ref::_ADTensor, x, ::Type{T}, dims) where {T}
     _broadcast_to(t, dims)
 end
 
+# A number branch of `select` becomes a full constant: tenferro-rs selects from a
+# broadcast (stride-0) operand several times slower than from a compact one.
+_select_operand(ref::_ADTensor, x::Number, ::Type{T}, dims) where {T} = _constant_tensor(ref, fill(convert(T, x), dims))
+_select_operand(ref::_ADTensor, x, ::Type{T}, dims) where {T} = _lift(ref, x, T, dims)
+
 function _select(condition, on_true, on_false)
     ref = _reference(condition, on_true, on_false)
     _operand_eltype(condition) === Bool || throw(ArgumentError("ifelse condition must contain Bool values"))
@@ -93,8 +98,8 @@ function _select(condition, on_true, on_false)
     T <: TensorElement || throw(ArgumentError("unsupported promoted tensor element type: $T"))
     dims = Base.Broadcast.broadcast_shape(_operand_size(condition), _operand_size(on_true), _operand_size(on_false))
     c = _lift(ref, condition, Bool, dims)
-    t = _lift(ref, on_true, T, dims)
-    f = _lift(ref, on_false, T, dims)
+    t = _select_operand(ref, on_true, T, dims)
+    f = _select_operand(ref, on_false, T, dims)
     id = _bridge(ref, RustCrate.select_node, RustCrate.traced_select_node, UInt(c.id), UInt(t.id), UInt(f.id))
     _wrap(ref, T, id, dims)
 end
