@@ -122,3 +122,13 @@ Each Tenferro operation crosses into Rust. A call that only adds a graph node co
 11–12 µs, almost all of it on the Rust side: semantic recording and runtime bookkeeping. The
 RustCall boundary itself costs about 1 µs. Models with many small operations are therefore
 limited by the number of operations, not by kernel time.
+
+Before each call, RustCall checks that no aggregate without a layout assertion is passed by
+value. It does this at compile time only when a signature has no aggregate at all, and every
+bridge method that returns a `Result` returns one: a `#[repr(C)]` result struct. Inside a
+training step that runtime check cost about 8 µs per call. Tenferro decides it at compile
+time for its own result structs, which carry RustCall's `FFIByValue` layout assertion; any
+aggregate argument is still checked at run time. In `benchmark_step.jl` (five alternated
+runs, medians of medians, ms) this took the MLP step from 1.24 to 1.11 (eager) and 1.40 to
+1.22 (traced) at one thread, and from 1.49 to 1.13 and 1.61 to 1.29 at eight. Zygote took
+1.21 and 0.68 in the same runs.
