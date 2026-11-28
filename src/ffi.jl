@@ -7,9 +7,11 @@ _dense_vector(x::AbstractArray) = vec(Array(x))
 _bytes(x::AbstractArray) = reinterpret(UInt8, _dense_vector(x))
 _dims(x::AbstractArray) = UInt[size(x)...]
 
-# Mutable slices must be initialized before they are borrowed.
+# A new array filled by `f(bytes)`. Every bridge writer (`encode` on the Rust side) checks the
+# length and overwrites the whole buffer, or fails before the array is returned, so the array
+# is not initialized first (zeroing it cost about 15–20 µs of an MNIST MLP step).
 function _read_array(f, ::Type{T}, dims) where {T}
-    out = zeros(T, dims)
+    out = Array{T}(undef, dims)
     f(_bytes(out))
     return out
 end
