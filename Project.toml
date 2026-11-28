@@ -15,11 +15,13 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [weakdeps]
 ChainRulesCore = "d360d2e6-b24c-11e9-a2a3-2a2ae2dbcce4"
+Functors = "d9f16b24-f501-4c13-a1f2-28368ffc5196"
 NNlib = "872c559c-99b0-510c-b3b7-b6c96a88d5cd"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 
 [extensions]
 TenferroChainRulesCoreExt = "ChainRulesCore"
+TenferroFunctorsExt = "Functors"
 TenferroNNlibExt = "NNlib"
 TenferroSpecialFunctionsExt = "SpecialFunctions"
 
@@ -27,6 +29,7 @@ TenferroSpecialFunctionsExt = "SpecialFunctions"
 ADTypes = "1.24.0"
 ChainRulesCore = "1.26"
 DifferentiationInterface = "0.7.21"
+Functors = "0.5"
 LinearAlgebra = "1.13.0"
 NNlib = "0.9.61"
 RustCall = "0.10.5"

@@ -7,7 +7,7 @@ import ADTypes
 using ADTypes: AbstractADType
 import DifferentiationInterface
 
-public stopgrad
+public stopgrad, constant, context
 
 export TypedTensor, AutoTenferro, EagerContext, EagerTensor, AutoTenferroTraced, TracedContext, TracedTensor
 
@@ -18,6 +18,7 @@ include("types.jl")
 include("operators.jl")
 include("interface.jl")
 include("nnops.jl")
+include("arrayops.jl")
 include("autodiff.jl")
 
 end

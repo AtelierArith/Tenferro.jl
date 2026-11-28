@@ -164,8 +164,6 @@ function _pad_rank(a::_ADTensor, rank)
     ndims(a) == rank && return a
     reshape(a, ntuple(i -> i <= ndims(a) ? a.dims[i] : 1, rank))
 end
-Base.vcat(a::_ADTensor, rest::_ADTensor...) = cat(a, rest...; dims=1)
-Base.hcat(a::_ADTensor, rest::_ADTensor...) = cat(a, rest...; dims=2)
 
 # Indexing --------------------------------------------------------------------
 

@@ -31,6 +31,13 @@ floating-point and complex operands use Julia's `promote_type`; cotangents are
 converted back to each active input's type. Unsupported promoted types are
 rejected. Tensors in one operation must share a context.
 
+`+`, `*`, `max` and `min` broadcast over more than two arguments as Julia's
+left fold, for example `max.(x, y, 0)`, and `muladd.(a, b, c)` and
+`fma.(a, b, c)` are `a .* b .+ c`. Partially applied functions with a scalar,
+such as `(>(0)).(x)` or `Base.Fix1(-, 1).(x)`, broadcast as the binary
+operation. `zero.(x)` and `one.(x)` are constant tensors. `similar` throws an
+`ArgumentError`: tensors are immutable.
+
 Same-type `Int32`/`Int64` tensors support forward `+`, `-`, elementwise `*`,
 `rem`, `min`, `max`, `abs`, and `sign`. Elementwise `/` converts integer and
 Boolean operands to `Float64`, matching Julia rather than Rust's integer
@@ -48,6 +55,29 @@ derivatives. `rem` uses derivatives `1` and `-div(x,y)` away from its
 discontinuities; its divisor must be nonzero. Complex `sign` uses the real
 derivative of `z / abs(z)` away from zero. Do not use finite differences across
 these discontinuities as a gradient reference.
+
+## Element-type casts and constants
+
+`S.(x)` casts a tensor to any tensor element type `S` (`Float32`, `Float64`,
+`ComplexF32`, `ComplexF64`, `Int32`, `Int64`, `Bool`) with the tenferro-rs
+`cast`, in both directions, for example `Float32.(x)` of a `Float64` tensor,
+`ComplexF64.(x)` of a real tensor, or `Float32.(x .> 0)` of a mask; `float.(x)`
+casts to the floating-point type of `eltype(x)`. Casts between floating-point and
+complex types are differentiable: cotangents are cast back to the input type.
+Casts to or from integer and `Bool` types carry no derivative. Floating-point
+values cast to integers truncate toward zero, any nonzero value casts to
+`true`, and integer narrowing wraps, unlike Julia's `InexactError`. A complex
+tensor cannot be cast to a real type, which would drop the imaginary part
+(Julia throws `InexactError` when it is nonzero); `real.(z)` and `imag.(z)`
+project it differentiably. `convert(EagerTensor{Float32}, x)` (and likewise for
+`TracedTensor`) is the same cast and returns `x` itself when it already has the
+requested type. Mixed-type arithmetic uses the same cast for promotion.
+
+`Tenferro.context(x)` returns the `EagerContext` or `TracedContext` that owns
+`x`, and `Tenferro.constant(x, array)` copies a Julia array or number into it as
+a constant, without derivatives, keeping its element type. Inside a function
+differentiated by `AutoTenferro()` or `AutoTenferroTraced()`, this is how to
+create tensors that combine with the traced input.
 
 ## Comparisons and selection
 
@@ -136,6 +166,14 @@ tenferro-rs has no convolution or `reduce_window` primitive, so these functions 
 
 `PoolDims`, `DenseConvDims` and `DepthwiseConvDims` accept tensors in place of arrays. Either operand of `conv`, `depthwiseconv`, `∇conv_data` and `∇conv_filter` may be a constant Julia array. `maximum` and `minimum` accept `init` (Lux's `GlobalMaxPool` calls `maximum(x; dims, init=-Inf)`), so Lux's global and adaptive pooling layers work. Convolution windows are built from `sum(kernel)` slices and concatenations (one per kernel offset and dimension); mean and Lp pooling sum `prod(kernel)` output-sized slices, or reshape and reduce when the windows do not overlap (stride equal to the kernel size). Anti-aliased bilinear upsampling, `upsample_bicubic` and complex inputs are not provided.
 
+`NNlib.gather(src, idx)` (and `gather(src, I, J, ...)`) accepts integers,
+integer tuples and `CartesianIndex`es as indices: one axis gather of `src` with
+the indexed trailing dimensions flattened. `NNlib.scatter(op, src, idx; init,
+dstsize)` supports `op` in `+`, `-` and `Statistics.mean`, built on the additive
+tenferro-rs `scatter`; repeated indices accumulate. Other operators (`max`,
+`min`, `*`, `/`) throw an `ArgumentError`. Indices are checked on the host;
+out-of-range indices throw a `BoundsError` instead of being clamped.
+
 ## Reductions
 
 `sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean` accept `dims`;
@@ -143,6 +181,9 @@ tenferro-rs has no convolution or `reduce_window` primitive, so these functions 
 one more `*`, `max` or `min`.
 `Statistics.var` and `Statistics.std` accept `dims`, `corrected` and a
 precomputed `mean`; they are composed from `mean`, `abs2` and `sum`.
+`sum(f, x)`, `prod(f, x)`, `maximum(f, x)`, `minimum(f, x)` and
+`Statistics.mean(f, x)` reduce `f.(x)`, with the same keywords; `f` must be a
+supported elementwise function such as `abs2`.
 Without `dims`, they reduce all elements to a scalar. With `dims`, Julia
 dimensions are converted from one-based to zero-based Rust axes; reduced
 dimensions are restored with extent one. Tuples of axes may be unordered.
@@ -168,8 +209,15 @@ The backend identity extension is tracked in
 A zero-length *non-reduced* dimension gives an empty output with the expected
 shape. An empty input is distinct from an empty tuple of reduction axes.
 The dtype and AD guarantees in this section apply to floating/complex types;
-integer widening (for example Julia's `sum(::Vector{Int32})`) and Boolean
-reductions are not supported Julia-compatible contracts.
+integer widening (for example Julia's `sum(::Vector{Int32})`) is not a supported
+Julia-compatible contract.
+
+`Bool` tensors reduce like Julia's: `sum(mask)` and `count(mask)` (also
+`count(f, x)`) return `Int64` counts, `mean(mask)` and the mean of an integer
+tensor are `Float64`, and `any(mask)`, `all(mask)`, `any(f, x)` and `all(f, x)`
+return `Bool`, all with optional `dims`. Without `dims` the eager result is a
+scalar tensor, not a Julia number: use `only(any(mask))` or `Bool(any(mask))` to
+branch on it. A traced result is a zero-dimensional traced tensor.
 
 ## Shapes, indexing, and ownership
 
@@ -184,6 +232,11 @@ positive dimension; lower-rank operands get trailing singleton dimensions, so
 `cat(a, b; dims=3)` of matrices or `hcat` of vectors works as in Julia.
 Every other axis must have equal extents; floating-point/complex types are
 promoted. `vcat` and `hcat` of tensors are `cat` along dimensions 1 and 2.
+Constant Julia arrays may be mixed with tensors in `cat`, `vcat` and `hcat`
+(the first tensor must be among the first three arguments), for example
+`hcat(x, ones(3, 1))`. `vec(x)` flattens to a vector, and `repeat(x, counts...)`
+and `repeat(x; inner, outer)` follow Base with positive counts, as a reshape and
+`broadcast_to` whose cotangents sum over the repeated entries.
 Block concatenation tuples are not exposed. `dropdims`, `selectdim`, and
 `eachslice` (returning a Julia array of tensor slices, with `drop`) follow Base.
 

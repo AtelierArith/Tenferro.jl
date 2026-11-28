@@ -13,6 +13,8 @@ AutoTenferroTraced
 TracedContext
 TracedTensor
 stopgrad
+constant
+context
 ```
 
 The NNlib, SpecialFunctions and ChainRulesCore package extensions add methods
@@ -22,4 +24,8 @@ With NNlib loaded, this includes activations, softmax, `batched_mul`, padding,
 convolution (`conv`, `depthwiseconv`, `∇conv_data`, `∇conv_filter`), pooling
 (`maxpool`, `meanpool`, `lpnormpool`) and upsampling (`upsample_nearest`,
 `upsample_linear`/`bilinear`/`trilinear`, `pixel_shuffle`); see
-[Convolution, pooling and upsampling](operations.md#Convolution,-pooling-and-upsampling).
+[Convolution, pooling and upsampling](operations.md#Convolution,-pooling-and-upsampling),
+and `NNlib.gather` and `NNlib.scatter` (`+`, `-`, `mean`).
+The Functors extension (`TenferroFunctorsExt`) makes `EagerTensor`,
+`TracedTensor` and eager scalars Functors.jl leaves, so `fmap` and `fleaves`
+treat each tensor as one value.

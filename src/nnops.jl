@@ -476,3 +476,73 @@ function _pixel_shuffle(x::_ADTensor, r::Integer)
     y = permutedims(y, (perm..., 2d + 1, 2d + 2))
     reshape(y, (map(s -> s * Int(r), sizein)..., cout, n))
 end
+
+# Gather and scatter ----------------------------------------------------------------------
+
+# Entries of an NNlib index array: integers, integer tuples or `CartesianIndex`es.
+_index_length(::Type{<:Integer}) = 1
+_index_length(::Type{<:NTuple{M,Integer}}) where {M} = M
+_index_length(::Type{CartesianIndex{M}}) where {M} = M
+_index_length(::Type{T}) where {T} = throw(ArgumentError("unsupported index element type $T"))
+
+# 1-based linear positions of `idx`'s entries in an array of size `dims`.
+function _linear_indices(idx::AbstractArray, dims)
+    isempty(idx) && throw(ArgumentError("empty index arrays are not supported"))
+    L = LinearIndices(dims)
+    map(vec(idx)) do i
+        I = CartesianIndex(Tuple(i)...)
+        checkbounds(Bool, L, I) || throw(BoundsError(L, Tuple(i)))
+        L[I]
+    end
+end
+
+"""
+    _gather(src, idx)
+
+NNlib's `gather`: `dst[:, ..., k] = src[:, ..., idx[k]...]` for every `k` in
+`CartesianIndices(idx)`. One axis gather of `src` with its indexed trailing
+dimensions flattened.
+"""
+function _gather(src::_ADTensor, idx::AbstractArray)
+    M, N = _index_length(eltype(idx)), ndims(src)
+    M <= N || throw(DimensionMismatch("indices of length $M cannot index a $N-dimensional tensor"))
+    front, tail = src.dims[1:(N - M)], src.dims[(N - M + 1):N]
+    flat = reshape(src, (front..., prod(tail)))
+    reshape(_gather_axis(flat, _linear_indices(idx, tail), N - M + 1), (front..., size(idx)...))
+end
+
+_max_index(idx::AbstractArray) = ntuple(d -> maximum(i -> Tuple(i)[d], idx), _index_length(eltype(idx)))
+
+"""
+    _scatter(op, src, idx, init, dstsize)
+
+NNlib's `scatter` for `op` in `+`, `-` and `mean`: entry `idx[k]` of the result
+combines the slices `src[:, ..., k]` that point to it (summed, negated sum or
+mean) with `init`, and entries nobody points to are `init`. Built on the
+additive scatter of tenferro-rs, which accumulates repeated indices.
+"""
+function _scatter(op::Symbol, src::_ADTensor, idx::AbstractArray, init, dstsize)
+    M, Nidx = _index_length(eltype(idx)), ndims(idx)
+    dims = ndims(src) - Nidx
+    dims >= 0 && src.dims[(dims + 1):end] == size(idx) || throw(ArgumentError("Incompatible input shapes."))
+    front = src.dims[1:dims]
+    dstsize = dstsize === nothing ? (front..., _max_index(idx)...) : Tuple(dstsize)
+    length(dstsize) == dims + M && dstsize[1:dims] == front || throw(ArgumentError("Incompatible input shapes."))
+    tail = dstsize[(dims + 1):end]
+    lin = _linear_indices(idx, tail)
+    T = eltype(src)
+    updates = reshape(src, (front..., length(lin)))
+    operand = _constant_tensor(src, zeros(T, (front..., prod(tail))))
+    ix = _constant_tensor(src, reshape(Int64.(lin) .- 1, :, 1))
+    id = _bridge(src, RustCrate.scatter_add_axis, RustCrate.traced_scatter_add_axis,
+                 UInt(operand.id), UInt(ix.id), UInt(updates.id), UInt(dims))
+    s = reshape(_wrap(src, T, id, operand.dims), dstsize)
+    if op === :mean
+        counts = zeros(Int, prod(tail))
+        foreach(l -> counts[l] += 1, lin)
+        s = _B.broadcasted(/, s, reshape(max.(counts, 1), (map(_ -> 1, front)..., tail...)))
+    elseif op === :-
+        s = _B.broadcasted(-, s)
+    end
+    init === nothing || iszero(init) ? s : _B.broadcasted(+, s, init)
+end
