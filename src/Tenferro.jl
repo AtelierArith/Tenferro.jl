@@ -13,6 +13,7 @@ export TypedTensor, AutoTenferro, EagerContext, EagerTensor, EagerScalar, AutoTe
 
 @rust_crate joinpath(@__DIR__, "..", "deps", "rust") submodule="RustCrate"
 
+include("rustcall.jl")
 include("ffi.jl")
 include("types.jl")
 include("operators.jl")
