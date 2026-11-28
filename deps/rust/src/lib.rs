@@ -1226,17 +1226,92 @@ fn traced_inputs<'a>(
 /// Compile `outputs` (nodes of a graph whose nodes are `nodes`) into one program and run it
 /// on the shared CPU engine, reusing the prepared program of an earlier graph of the same
 /// structure (see `traced_cache`).
+///
+/// With `call`, the call log of the graph and the request (see `TracedGraph::evaluate_ids`), a
+/// program whose inputs could be matched is also remembered under that log, so a later graph
+/// with the same log runs it without tracing the derivative or compiling.
 fn run_traced(
     nodes: &[tenferro_runtime::TracedTensor],
     outputs: &[&tenferro_runtime::TracedTensor],
+    call: Option<Box<[u64]>>,
 ) -> FfiResult<Vec<Tensor>> {
     let program = tenferro_runtime::GraphCompiler::new().compile_many(outputs)?;
     let inputs = traced_inputs(&program, nodes)?;
-    let values = engine::with_engine_programs(|engine, programs| programs.run(engine, &program, inputs.as_deref()))?;
+    let call = match (&inputs, call) {
+        (Some(_), Some(key)) => traced_sources(&program, nodes).map(|sources| (key, sources)),
+        _ => None,
+    };
+    let values =
+        engine::with_engine_programs(|engine, programs| programs.run(engine, &program, inputs.as_deref(), call))?;
     if values.len() != outputs.len() {
         return Err("traced program returned the wrong number of outputs".into());
     }
     Ok(values)
+}
+
+/// The leaf among `nodes` (by node id) whose tensor each input of `program` holds, or `None`
+/// when an input holds no leaf's tensor.
+///
+/// Such inputs are tensors the AD transform made, and it can make them from a leaf's data (an
+/// imported tangent, say), so a program with one is not reused by call log: the next graph's
+/// data would not reach it.
+fn traced_sources(
+    program: &tenferro_runtime::CompiledGraph,
+    nodes: &[tenferro_runtime::TracedTensor],
+) -> Option<Box<[usize]>> {
+    let mut leaves = std::collections::HashMap::new();
+    let mut values = std::collections::HashMap::new();
+    for (id, node) in nodes.iter().enumerate() {
+        if let (Some(key), Some(value)) = (node.input_key(), node.attached_value()) {
+            leaves.insert(key, id);
+            values.entry(std::sync::Arc::as_ptr(value)).or_insert(id);
+        }
+    }
+    program
+        .input_keys()
+        .iter()
+        .zip(program.bindings().iter())
+        .map(|(key, (_, value))| {
+            // An input under a key of its own can still hold a leaf's tensor (the AD transform
+            // imports seeds and tangents that way); it is that leaf's data too.
+            leaves.get(key).or_else(|| values.get(&std::ptr::from_ref(value))).copied()
+        })
+        .collect()
+}
+
+/// Whether every call-log cache hit is checked against a fresh trace
+/// (`TENFERRO_VERIFY_TRACED_CALLS=1`; for tests).
+fn verify_calls() -> bool {
+    static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFY.get_or_init(|| std::env::var("TENFERRO_VERIFY_TRACED_CALLS").is_ok_and(|value| value.trim() == "1"))
+}
+
+/// Fail unless `a` and `b` hold the same dtypes, shapes and bits.
+fn check_same_values(a: &[Tensor], b: &[Tensor]) -> FfiResult<()> {
+    fn bytes(tensor: &Tensor) -> FfiResult<Vec<u8>> {
+        let (kind, size) = match tensor.dtype() {
+            tenferro_tensor::DType::F32 => (0, 4),
+            tenferro_tensor::DType::F64 => (1, 8),
+            tenferro_tensor::DType::I32 => (2, 4),
+            tenferro_tensor::DType::I64 => (3, 8),
+            tenferro_tensor::DType::C32 => (4, 8),
+            tenferro_tensor::DType::C64 => (5, 16),
+            tenferro_tensor::DType::Bool => (6, 1),
+            _ => return Err("unsupported element type".into()),
+        };
+        let mut out = vec![0u8; size * tensor.shape().iter().product::<usize>()];
+        copy_tensor(tensor, &mut out, kind)?;
+        Ok(out)
+    }
+    let same = a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.dtype() == y.dtype() && x.shape() == y.shape() && matches!((bytes(x), bytes(y)), (Ok(p), Ok(q)) if p == q)
+        });
+    if same {
+        Ok(())
+    } else {
+        Err("a cached traced call differs from a fresh trace".into())
+    }
 }
 
 /// Entries, hits and misses of the prepared traced program cache of the shared engine.
@@ -1256,6 +1331,23 @@ pub struct TracedGraph {
     nodes: Vec<tenferro_runtime::TracedTensor>,
     /// Values of evaluated nodes. Traced nodes are immutable, so a value never goes stale.
     values: std::collections::HashMap<usize, Tensor>,
+    /// Every call that built this graph, with its arguments (but not the data of leaves).
+    ///
+    /// Two graphs with the same log have the same structure, so the log keys what the shared
+    /// engine remembers about earlier graphs (see `traced_cache`).
+    log: Vec<u64>,
+    /// Reverse passes not traced yet, because an earlier graph with the same log showed which
+    /// derivatives they have; their nodes are reserved after `nodes`.
+    pending: Vec<PendingVjp>,
+    /// Node ids reserved by `pending`.
+    reserved: usize,
+}
+
+struct PendingVjp {
+    output: usize,
+    inputs: Vec<usize>,
+    seed: usize,
+    pattern: Box<[bool]>,
 }
 
 #[julia]
@@ -1266,6 +1358,9 @@ impl TracedGraph {
             trace: tenferro_runtime::TraceContext::new(),
             nodes: Vec::new(),
             values: std::collections::HashMap::new(),
+            log: Vec::new(),
+            pending: Vec::new(),
+            reserved: 0,
         }
     }
 
@@ -1276,6 +1371,8 @@ impl TracedGraph {
         shape: &[usize],
         kind: i32,
     ) -> Result<i64, String> {
+        self.begin(1, &[kind as u64])?;
+        self.rec_slice(shape);
         let result = (|| {
             Ok(self.trace.from_tensor_concrete_shape(
                 input_tensor(data, shape, kind)?,
@@ -1294,9 +1391,10 @@ impl TracedGraph {
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
             if !self.values.contains_key(&node) {
-                let tensor = self.nodes.get(node).ok_or("invalid node")?;
-                let value = run_traced(&self.nodes, &[tensor])?.pop().ok_or("missing output")?;
-                self.values.insert(node, value);
+                if node >= self.node_count() {
+                    return Err("invalid node".into());
+                }
+                self.evaluate_ids(vec![node])?;
             }
             copy_tensor(&self.values[&node], out, kind)
         })();
@@ -1313,10 +1411,30 @@ impl TracedGraph {
         seed: usize,
         out: &mut [i64],
     ) -> Result<i32, String> {
-        let result = (|| -> FfiResult<Vec<Option<tenferro_runtime::TracedTensor>>> {
-            if out.len() != inputs.len() {
-                return Err("output id buffer does not match the inputs".into());
+        self.begin(28, &[output as u64, seed as u64])?;
+        self.rec_slice(inputs);
+        if out.len() != inputs.len() {
+            return Err("output id buffer does not match the inputs".to_string());
+        }
+        // A graph with this log was differentiated before: defer tracing the reverse pass,
+        // which a later evaluation of the same log does not need.
+        let log = &self.log;
+        let known = engine::with_engine_programs(|_, programs| programs.vjp_pattern(log));
+        if let Some(pattern) = known.filter(|pattern| pattern.len() == inputs.len()) {
+            let mut next = self.node_count();
+            for (slot, &has) in out.iter_mut().zip(pattern.iter()) {
+                *slot = if has {
+                    next += 1;
+                    (next - 1) as i64
+                } else {
+                    -2
+                };
             }
+            self.reserved += pattern.iter().filter(|&&has| has).count();
+            self.pending.push(PendingVjp { output, inputs: inputs.to_vec(), seed, pattern });
+            return Ok(0);
+        }
+        let result = (|| -> FfiResult<Vec<Option<tenferro_runtime::TracedTensor>>> {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let seed = self.nodes.get(seed).ok_or("invalid seed")?;
             let xs = inputs
@@ -1326,6 +1444,9 @@ impl TracedGraph {
             Ok(ad_context()?.vjp_many(y, &xs, seed)?)
         })();
         let grads = result.map_err(|err| err.to_string())?;
+        let pattern: Box<[bool]> = grads.iter().map(Option::is_some).collect();
+        let key: Box<[u64]> = self.log.as_slice().into();
+        engine::with_engine_programs(|_, programs| programs.store_vjp(key, pattern));
         for (slot, grad) in out.iter_mut().zip(grads) {
             *slot = match grad {
                 Some(value) => self.push(value),
@@ -1343,24 +1464,23 @@ impl TracedGraph {
             let mut ids: Vec<usize> = Vec::with_capacity(nodes.len());
             for &id in nodes {
                 if !self.values.contains_key(&id) && !ids.contains(&id) {
-                    self.nodes.get(id).ok_or("invalid node")?;
+                    if id >= self.node_count() {
+                        return Err("invalid node".into());
+                    }
                     ids.push(id);
                 }
             }
             if ids.is_empty() {
                 return Ok(());
             }
-            let tensors: Vec<&tenferro_runtime::TracedTensor> =
-                ids.iter().map(|&id| &self.nodes[id]).collect();
-            let values = run_traced(&self.nodes, &tensors)?;
-            self.values.extend(ids.into_iter().zip(values));
-            Ok(())
+            self.evaluate_ids(ids)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
     }
 
     #[julia]
     pub fn traced_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        self.begin(2, &[input as u64, op as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(match op {
@@ -1386,6 +1506,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_cast_node(&mut self, input: usize, kind: i32) -> Result<i64, String> {
+        self.begin(3, &[input as u64, kind as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(x.cast(any_dtype(kind)?)?)
@@ -1402,6 +1523,7 @@ impl TracedGraph {
         updates: usize,
         axis: usize,
     ) -> Result<i64, String> {
+        self.begin(4, &[operand as u64, indices as u64, updates as u64, axis as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(operand).ok_or("invalid operand")?;
             let ix = self.nodes.get(indices).ok_or("invalid indices")?;
@@ -1420,6 +1542,7 @@ impl TracedGraph {
         indices: usize,
         axis: usize,
     ) -> Result<i64, String> {
+        self.begin(5, &[input as u64, indices as u64, axis as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let ix = self.nodes.get(indices).ok_or("invalid indices")?;
@@ -1432,6 +1555,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_compare_node(&mut self, lhs: usize, rhs: usize, dir: i32) -> Result<i64, String> {
+        self.begin(6, &[lhs as u64, rhs as u64, dir as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
@@ -1448,6 +1572,7 @@ impl TracedGraph {
         on_true: usize,
         on_false: usize,
     ) -> Result<i64, String> {
+        self.begin(7, &[condition as u64, on_true as u64, on_false as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let c = self.nodes.get(condition).ok_or("invalid condition")?;
             let t = self.nodes.get(on_true).ok_or("invalid true branch")?;
@@ -1464,6 +1589,8 @@ impl TracedGraph {
         ids: &[usize],
         axis: usize,
     ) -> Result<i64, String> {
+        self.begin(8, &[axis as u64])?;
+        self.rec_slice(ids);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let inputs: Vec<&tenferro_runtime::TracedTensor> = ids
                 .iter()
@@ -1480,6 +1607,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_linalg_factor(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        self.begin(9, &[input as u64, op as u64])?;
         use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<Vec<tenferro_runtime::TracedTensor>> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
@@ -1515,6 +1643,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_norm_node(&mut self, input: usize) -> Result<i64, String> {
+        self.begin(10, &[input as u64])?;
         use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
@@ -1526,6 +1655,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_linalg_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        self.begin(11, &[input as u64, op as u64])?;
         use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
@@ -1548,6 +1678,7 @@ impl TracedGraph {
         rhs: usize,
         least_squares: bool,
     ) -> Result<i64, String> {
+        self.begin(12, &[lhs as u64, rhs as u64, least_squares as u64])?;
         use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
@@ -1569,6 +1700,7 @@ impl TracedGraph {
         op: i32,
         k: i64,
     ) -> Result<i64, String> {
+        self.begin(13, &[input as u64, op as u64, k as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(match op {
@@ -1588,6 +1720,8 @@ impl TracedGraph {
         input: usize,
         bounds: &[usize],
     ) -> Result<i64, String> {
+        self.begin(14, &[input as u64])?;
+        self.rec_slice(bounds);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let rank = x.rank();
@@ -1611,6 +1745,8 @@ impl TracedGraph {
         input: usize,
         shape: &[usize],
     ) -> Result<i64, String> {
+        self.begin(15, &[input as u64])?;
+        self.rec_slice(shape);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let dims: Vec<usize> = (0..x.rank()).collect();
@@ -1627,6 +1763,8 @@ impl TracedGraph {
         args: &[usize],
         op: i32,
     ) -> Result<i64, String> {
+        self.begin(16, &[input as u64, op as u64])?;
+        self.rec_slice(args);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let axes: Vec<isize> = args.iter().map(|&axis| axis as isize).collect();
@@ -1648,6 +1786,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_binary(&mut self, lhs: usize, rhs: usize, op: i32) -> Result<i64, String> {
+        self.begin(17, &[lhs as u64, rhs as u64, op as u64])?;
         let result = (|| {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
@@ -1676,6 +1815,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_sum(&mut self, input: usize) -> Result<i64, String> {
+        self.begin(18, &[input as u64])?;
         let result = (|| {
             Ok(self
                 .nodes
@@ -1689,6 +1829,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_activation(&mut self, input: usize, op: i32) -> Result<i64, String> {
+        self.begin(19, &[input as u64, op as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(match op {
@@ -1713,6 +1854,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_softmax_node(&mut self, input: usize, axis: usize, log: bool) -> Result<i64, String> {
+        self.begin(20, &[input as u64, axis as u64, log as u64])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(if log {
@@ -1728,6 +1870,9 @@ impl TracedGraph {
     /// Traced [`EagerGraph::window_node`].
     #[julia]
     pub fn traced_window_node(&mut self, inputs: &[usize], kind: i32, geometry: &[i64]) -> Result<i64, String> {
+        self.begin(21, &[kind as u64])?;
+        self.rec_slice(inputs);
+        self.rec_islice(geometry);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let op = window_extension::WindowOp::new(kind, geometry)?;
             let xs = inputs
@@ -1745,6 +1890,8 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_dense_node(&mut self, inputs: &[usize], act: i32) -> Result<i64, String> {
+        self.begin(22, &[act as u64])?;
+        self.rec_slice(inputs);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let op = dense_op(inputs.len(), act)?;
             let xs = inputs
@@ -1762,6 +1909,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_xent_node(&mut self, yhat: usize, y: usize, scale: f64) -> Result<i64, String> {
+        self.begin(23, &[yhat as u64, y as u64, scale.to_bits()])?;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let yhat = self.nodes.get(yhat).ok_or("invalid logits")?;
             let y = self.nodes.get(y).ok_or("invalid targets")?;
@@ -1779,6 +1927,8 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_pad_node(&mut self, input: usize, amounts: &[i64]) -> Result<i64, String> {
+        self.begin(24, &[input as u64])?;
+        self.rec_islice(amounts);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(x.pad(pad_config(x.rank(), amounts)?)?)
@@ -1794,6 +1944,8 @@ impl TracedGraph {
         rhs: usize,
         dims: &[usize],
     ) -> Result<i64, String> {
+        self.begin(25, &[lhs as u64, rhs as u64])?;
+        self.rec_slice(dims);
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
@@ -1811,6 +1963,7 @@ impl TracedGraph {
         seed: usize,
         forward: bool,
     ) -> Result<i64, String> {
+        self.begin(26, &[output as u64, input as u64, seed as u64, forward as u64])?;
         let result = (|| -> FfiResult<Option<tenferro_runtime::TracedTensor>> {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
@@ -1831,6 +1984,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_grad(&mut self, output: usize, input: usize) -> Result<i64, String> {
+        self.begin(27, &[output as u64, input as u64])?;
         let result: Result<Option<tenferro_runtime::TracedTensor>, Box<dyn std::error::Error>> =
             (|| {
                 let y = self.nodes.get(output).ok_or("invalid output")?;
@@ -1847,6 +2001,85 @@ impl TracedGraph {
 }
 
 impl TracedGraph {
+    /// Nodes made so far, including the reserved ones of deferred reverse passes.
+    fn node_count(&self) -> usize {
+        self.nodes.len() + self.reserved
+    }
+
+    /// Trace the deferred reverse passes, then log the call `tag(words)` that is about to
+    /// change the graph.
+    fn begin(&mut self, tag: u64, words: &[u64]) -> Result<(), String> {
+        self.materialize().map_err(|err| err.to_string())?;
+        self.log.push(tag);
+        self.log.extend_from_slice(words);
+        Ok(())
+    }
+
+    fn rec_slice(&mut self, values: &[usize]) {
+        self.log.push(values.len() as u64);
+        self.log.extend(values.iter().map(|&value| value as u64));
+    }
+
+    fn rec_islice(&mut self, values: &[i64]) {
+        self.log.push(values.len() as u64);
+        self.log.extend(values.iter().map(|&value| value as u64));
+    }
+
+    /// Trace the deferred reverse passes; their derivatives get the reserved node ids.
+    fn materialize(&mut self) -> FfiResult<()> {
+        for pending in std::mem::take(&mut self.pending) {
+            let y = self.nodes.get(pending.output).ok_or("invalid output")?;
+            let seed = self.nodes.get(pending.seed).ok_or("invalid seed")?;
+            let xs = pending
+                .inputs
+                .iter()
+                .map(|&id| self.nodes.get(id).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let grads = ad_context()?.vjp_many(y, &xs, seed)?;
+            if !grads.iter().map(Option::is_some).eq(pending.pattern.iter().copied()) {
+                return Err("a deferred reverse pass has other derivatives than its earlier trace".into());
+            }
+            self.reserved -= pending.pattern.iter().filter(|&&has| has).count();
+            self.nodes.extend(grads.into_iter().flatten());
+        }
+        Ok(())
+    }
+
+    /// Compute the values of the nodes `ids` (none evaluated yet) as one program.
+    ///
+    /// The program is looked up first by the call log of this graph and `ids`: when an earlier
+    /// graph with the same log evaluated the same nodes, its prepared program runs on this
+    /// graph's leaves, and neither the deferred reverse passes nor the program are traced.
+    fn evaluate_ids(&mut self, ids: Vec<usize>) -> FfiResult<()> {
+        let mut key = Vec::with_capacity(self.log.len() + ids.len() + 2);
+        key.extend_from_slice(&self.log);
+        key.push(u64::MAX);
+        key.push(ids.len() as u64);
+        key.extend(ids.iter().map(|&id| id as u64));
+        let nodes = &self.nodes;
+        let cached = engine::with_engine_programs(|engine, programs| programs.run_call(engine, &key, nodes))?;
+        let values = match cached {
+            Some(values) if !verify_calls() => values,
+            cached => {
+                self.materialize()?;
+                let tensors = ids
+                    .iter()
+                    .map(|&id| self.nodes.get(id).ok_or("invalid node"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let values = run_traced(&self.nodes, &tensors, Some(key.into()))?;
+                if let Some(cached) = cached {
+                    check_same_values(&cached, &values)?;
+                }
+                values
+            }
+        };
+        if values.len() != ids.len() {
+            return Err("traced program returned the wrong number of outputs".into());
+        }
+        self.values.extend(ids.into_iter().zip(values));
+        Ok(())
+    }
+
     fn push(&mut self, value: tenferro_runtime::TracedTensor) -> i64 {
         let id = self.nodes.len();
         self.nodes.push(value);
