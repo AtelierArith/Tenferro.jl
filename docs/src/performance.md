@@ -42,6 +42,17 @@ the traced backend, the value and all gradients are compiled and run as one prog
 `TracedContext` keeps the value of every node it has evaluated until it is closed, so
 reading a value again does not recompile.
 
+Traced programs are also prepared only once per structure. Each `TracedContext` is a new
+trace, but a training step traces the same computation every time. The shared engine keeps
+one tenferro-rs runtime and its 32 most recently prepared programs. A new program with the
+same normalized structure and the same input element types and shapes reuses the prepared
+one and runs on the new trace's input tensors. Data does not have to match; numbers and
+arrays mixed into the computation are inputs too. Each cached program keeps the input
+tensors of the trace that prepared it until it is evicted. Changing the thread count clears
+the cache together with the engine. On the MNIST MLP step this took `AutoTenferroTraced`
+from 1.24 to 0.95–0.97 ms at one thread and from 1.31 to 0.90 ms at eight (median of
+interleaved runs; CNN 16.2 → 15.4 ms and 15.1 → 13.8 ms).
+
 Arrays and numbers that are mixed into tensor operations, `Tenferro.constant` values and
 `DifferentiationInterface.Constant` data are untracked constants. No gradient is computed
 for them, and they do not take part in reverse passes.
