@@ -172,9 +172,9 @@ impl EagerGraph {
                 .ok_or_else(|| self.init_error.as_str())?
                 .clone();
             Ok(if matches!(kind, 0 | 1 | 4 | 5) {
-                EagerTensor::requires_grad_in(tensor, ctx)?
+                ctx.variable_from(tensor)?
             } else {
-                EagerTensor::from_tensor_in(tensor, ctx)?
+                ctx.constant_from(tensor)?
             })
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
@@ -189,11 +189,10 @@ impl EagerGraph {
         kind: i32,
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
-            let value = self
-                .nodes
-                .get(node)
-                .ok_or("invalid node")?
-                .to_tensor(&mut tenferro_cpu::CpuEngine::serial())?;
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let node = self.nodes.get(node).ok_or("invalid node")?;
+            let mut engine = tenferro_cpu::CpuEngine::serial();
+            let value = ctx.with_eager_session(&mut engine, |s| s.duplicate_value(node))?;
             copy_tensor(&value, out, kind)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
@@ -205,8 +204,8 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let input = self.nodes.get(node).ok_or("invalid input")?;
             let mut engine = tenferro_cpu::CpuEngine::serial();
-            let value = input.to_tensor(&mut engine)?;
-            Ok(EagerTensor::requires_grad_in(value, ctx.clone())?)
+            let value = ctx.with_eager_session(&mut engine, |s| s.duplicate_value(input))?;
+            Ok(ctx.variable_from(value)?)
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
         Ok(self.push(value))
@@ -219,7 +218,9 @@ impl EagerGraph {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let seed = self.nodes.get(seed).ok_or("invalid cotangent")?;
-            Ok(ctx.vjp_optional(&mut tenferro_cpu::CpuEngine::serial(), y, x, seed)?)
+            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                s.vjp_optional(y, x, seed)
+            })?)
         })();
         match result {
             Ok(Some(value)) => Ok(self.push(value)),
@@ -235,7 +236,9 @@ impl EagerGraph {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let seed = self.nodes.get(seed).ok_or("invalid tangent")?;
-            Ok(ctx.jvp_optional(&mut tenferro_cpu::CpuEngine::serial(), y, x, seed)?)
+            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                s.jvp_optional(y, x, seed)
+            })?)
         })();
         match result {
             Ok(Some(value)) => Ok(self.push(value)),
@@ -325,7 +328,7 @@ impl EagerGraph {
                 .collect::<Result<_, _>>()?;
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
-                    s.concatenate(&inputs, axis)
+                    s.concatenate(&inputs, axis as isize)
                 })?,
             )
         })();
@@ -335,31 +338,31 @@ impl EagerGraph {
 
     #[julia]
     pub fn linalg_factor(&mut self, input: usize, op: i32) -> Result<i64, String> {
-        use tenferro_linalg::EagerSessionLinalgExt;
+        use tenferro_linalg::EagerLinalgOps;
         let result = (|| -> FfiResult<Vec<EagerTensor>> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
                     0 => {
-                        let (u, v, w) = s.svd(x)?;
-                        Ok::<_, tenferro_ad::Error>(vec![u, v, w])
+                        let r = s.svd(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![r.u, r.s, r.vh])
                     }
                     1 => {
-                        let (q, r) = s.qr(x)?;
-                        Ok::<_, tenferro_ad::Error>(vec![q, r])
+                        let r = s.qr(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![r.q, r.r])
                     }
                     2 => {
-                        let (v, w) = s.eig(x)?;
-                        Ok::<_, tenferro_ad::Error>(vec![v, w])
+                        let r = s.eig(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![r.values, r.vectors])
                     }
                     3 => {
-                        let (v, w) = s.eigh(x)?;
-                        Ok::<_, tenferro_ad::Error>(vec![v, w])
+                        let r = s.eigh(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![r.values, r.vectors])
                     }
                     4 => {
-                        let (p, l, u, parity) = s.lu(x)?;
-                        Ok::<_, tenferro_ad::Error>(vec![p, l, u, parity])
+                        let r = s.lu(x)?;
+                        Ok::<_, tenferro_ad::Error>(vec![r.p, r.l, r.u, r.parity])
                     }
                     _ => unreachable!(),
                 })?,
@@ -373,13 +376,13 @@ impl EagerGraph {
 
     #[julia]
     pub fn norm_node(&mut self, input: usize) -> Result<i64, String> {
-        use tenferro_linalg::EagerSessionLinalgExt;
+        use tenferro_linalg::EagerLinalgOps;
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
-                    s.norm(x, None, None, false)
+                    s.norm(x)
                 })?,
             )
         })();
@@ -389,7 +392,7 @@ impl EagerGraph {
 
     #[julia]
     pub fn linalg_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
-        use tenferro_linalg::EagerSessionLinalgExt;
+        use tenferro_linalg::EagerLinalgOps;
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
@@ -414,20 +417,18 @@ impl EagerGraph {
         rhs: usize,
         least_squares: bool,
     ) -> Result<i64, String> {
-        use tenferro_linalg::{EagerSessionLinalgExt, EagerTensorLinalgExt};
+        use tenferro_linalg::EagerLinalgOps;
         let result = (|| -> FfiResult<EagerTensor> {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
-            if least_squares {
-                let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
-                Ok(
-                    ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
-                        s.lstsq(a, b)
-                    })?,
-                )
-            } else {
-                Ok(a.solve(&mut tenferro_cpu::CpuEngine::serial(), b)?)
-            }
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                if least_squares {
+                    s.lstsq(a, b)
+                } else {
+                    s.solve(a, b)
+                }
+            })?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -509,16 +510,17 @@ impl EagerGraph {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
+            let axes: Vec<isize> = args.iter().map(|&axis| axis as isize).collect();
             Ok(
                 ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
                     0 => s.reshape(x, args),
-                    1 => s.transpose(x, args),
-                    2 => s.reduce_sum(x, Some(args)),
-                    3 => s.reverse(x, args),
-                    4 => s.reduce_prod(x, Some(args)),
-                    5 => s.reduce_max(x, Some(args)),
-                    6 => s.reduce_min(x, Some(args)),
-                    7 => s.reduce_mean(x, Some(args)),
+                    1 => s.transpose(x, &axes),
+                    2 => s.reduce_sum(x, Some(&axes)),
+                    3 => s.reverse(x, &axes),
+                    4 => s.reduce_prod(x, Some(&axes)),
+                    5 => s.reduce_max(x, Some(&axes)),
+                    6 => s.reduce_min(x, Some(&axes)),
+                    7 => s.reduce_mean(x, Some(&axes)),
                     _ => unreachable!(),
                 })?,
             )
@@ -737,7 +739,10 @@ impl TracedGraph {
                 .iter()
                 .map(|id| self.nodes.get(*id).ok_or("invalid input"))
                 .collect::<Result<_, _>>()?;
-            Ok(tenferro_runtime::TracedTensor::concatenate(&inputs, axis)?)
+            Ok(tenferro_runtime::TracedTensor::concatenate(
+                &inputs,
+                axis as isize,
+            )?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -745,29 +750,29 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_linalg_factor(&mut self, input: usize, op: i32) -> Result<i64, String> {
-        use tenferro_linalg::TracedTensorLinalgExt;
+        use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<Vec<tenferro_runtime::TracedTensor>> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(match op {
                 0 => {
-                    let (u, v, w) = x.svd()?;
-                    vec![u, v, w]
+                    let r = x.svd()?;
+                    vec![r.u, r.s, r.vh]
                 }
                 1 => {
-                    let (q, r) = x.qr()?;
-                    vec![q, r]
+                    let r = x.qr()?;
+                    vec![r.q, r.r]
                 }
                 2 => {
-                    let (v, w) = x.eig()?;
-                    vec![v, w]
+                    let r = x.eig()?;
+                    vec![r.values, r.vectors]
                 }
                 3 => {
-                    let (v, w) = x.eigh()?;
-                    vec![v, w]
+                    let r = x.eigh()?;
+                    vec![r.values, r.vectors]
                 }
                 4 => {
-                    let (p, l, u, parity) = x.lu()?;
-                    vec![p, l, u, parity]
+                    let r = x.lu()?;
+                    vec![r.p, r.l, r.u, r.parity]
                 }
                 _ => unreachable!(),
             })
@@ -780,10 +785,10 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_norm_node(&mut self, input: usize) -> Result<i64, String> {
-        use tenferro_linalg::TracedTensorLinalgExt;
+        use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            Ok(x.norm(None, None, false)?)
+            Ok(x.norm()?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -791,7 +796,7 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_linalg_unary(&mut self, input: usize, op: i32) -> Result<i64, String> {
-        use tenferro_linalg::TracedTensorLinalgExt;
+        use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(match op {
@@ -813,7 +818,7 @@ impl TracedGraph {
         rhs: usize,
         least_squares: bool,
     ) -> Result<i64, String> {
-        use tenferro_linalg::TracedTensorLinalgExt;
+        use tenferro_linalg::TracedLinalgOps;
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
@@ -894,15 +899,16 @@ impl TracedGraph {
     ) -> Result<i64, String> {
         let result = (|| -> FfiResult<tenferro_runtime::TracedTensor> {
             let x = self.nodes.get(input).ok_or("invalid input")?;
+            let axes: Vec<isize> = args.iter().map(|&axis| axis as isize).collect();
             Ok(match op {
                 0 => x.reshape(args)?,
-                1 => x.transpose(args)?,
-                2 => x.reduce_sum(Some(args))?,
-                3 => x.reverse(args)?,
-                4 => x.reduce_prod(Some(args))?,
-                5 => x.reduce_max(Some(args))?,
-                6 => x.reduce_min(Some(args))?,
-                7 => x.reduce_mean(Some(args))?,
+                1 => x.transpose(&axes)?,
+                2 => x.reduce_sum(Some(&axes))?,
+                3 => x.reverse(&axes)?,
+                4 => x.reduce_prod(Some(&axes))?,
+                5 => x.reduce_max(Some(&axes))?,
+                6 => x.reduce_min(Some(&axes))?,
+                7 => x.reduce_mean(Some(&axes))?,
                 _ => unreachable!(),
             })
         })();
