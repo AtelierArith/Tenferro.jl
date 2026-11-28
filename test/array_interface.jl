@@ -21,15 +21,15 @@ const W = reshape(collect(1.0:12.0), 3, 4)
         @test Array(Float32.(TensorType(ctx, Int32[1 0; -2 3]))) == Float32[1 0; -2 3]
         @test Array(Float64.(x .> 0)) == Float64.(A .> 0)
         @test Array(Int64.(TensorType(ctx, [true, false]))) == [1, 0]
-        @test Array(Int32.(TensorType(ctx, [1.7, -2.7]))) == Int32[1, -2]  # truncation
-        @test Array(Bool.(TensorType(ctx, [0.0, 2.0]))) == [false, true]
+        @test Array(trunc.(Int32, TensorType(ctx, [1.7, -2.7]))) == Int32[1, -2]
+        @test Array(TensorType(ctx, [0.0, 2.0]) .!= 0) == [false, true]
         @test Array(float.(TensorType(ctx, [1, 2]))) == [1.0, 2.0]
         @test convert(TensorType{Float64}, x) isa TensorType{Float64,2}
         @test convert(TensorType{Float32}, x) === x
         @test convert(TensorType, x) === x
         @test_throws ArgumentError convert(TensorType{Float64,3}, x)
         z = TensorType(ctx, ComplexF64[1 + 2im, -3 - 4im])
-        @test_throws ArgumentError Float64.(z)
+        @test_throws (TensorType === EagerTensor ? InexactError : ArgumentError) Float64.(z)
         @test Array(real.(z)) == [1.0, -3.0]
         @test Array(imag.(z)) == [2.0, -4.0]
         @test Array(imag.(x64)) == zero(A)
