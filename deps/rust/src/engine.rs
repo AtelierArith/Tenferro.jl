@@ -10,6 +10,8 @@ use std::sync::Mutex;
 
 use tenferro_cpu::CpuEngine;
 
+use crate::traced_cache::TracedPrograms;
+
 /// Worker threads requested by the caller; `0` means "not set yet".
 static REQUESTED_THREADS: AtomicUsize = AtomicUsize::new(0);
 
@@ -17,6 +19,8 @@ struct Shared {
     engine: CpuEngine,
     /// The thread count this engine was requested with (it may have fallen back to serial).
     requested: usize,
+    /// The runtime and prepared programs of traced evaluations on this engine.
+    programs: TracedPrograms,
 }
 
 static ENGINE: Mutex<Option<Shared>> = Mutex::new(None);
@@ -56,6 +60,7 @@ fn build(threads: usize) -> Shared {
     Shared {
         engine: pool.map_or_else(CpuEngine::serial, CpuEngine::new),
         requested: threads,
+        programs: TracedPrograms::default(),
     }
 }
 
@@ -64,6 +69,11 @@ fn build(threads: usize) -> Shared {
 /// The engine is (re)built when it does not exist yet, when the requested thread
 /// count changed, or when an earlier panic left it broken.
 pub fn with_engine<R>(f: impl FnOnce(&mut CpuEngine) -> R) -> R {
+    with_engine_programs(|engine, _| f(engine))
+}
+
+/// Like [`with_engine`], also lending the engine's traced runtime and prepared programs.
+pub fn with_engine_programs<R>(f: impl FnOnce(&mut CpuEngine, &mut TracedPrograms) -> R) -> R {
     let mut guard = ENGINE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let threads = requested_threads();
     let stale = match guard.as_ref() {
@@ -74,7 +84,7 @@ pub fn with_engine<R>(f: impl FnOnce(&mut CpuEngine) -> R) -> R {
         *guard = Some(build(threads));
     }
     let shared = guard.as_mut().expect("engine was just built");
-    f(&mut shared.engine)
+    f(&mut shared.engine, &mut shared.programs)
 }
 
 /// The number of worker threads of the shared engine (building it if needed).

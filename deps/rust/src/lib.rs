@@ -3,6 +3,7 @@ mod dense_extension;
 mod engine;
 mod kernels;
 mod rem_extension;
+mod traced_cache;
 mod relu_extension;
 mod window_extension;
 mod xent_extension;
@@ -1177,42 +1178,76 @@ impl EagerGraph {
     }
 }
 
-/// Compile `outputs` into one program and run it on the shared CPU engine.
-fn run_traced(outputs: &[&tenferro_runtime::TracedTensor]) -> FfiResult<Vec<Tensor>> {
-    use tenferro_runtime::{ExecutionEngine, GraphCompiler, Runtime};
-    let program = GraphCompiler::new().compile_many(outputs)?;
-    engine::with_engine(|engine| -> FfiResult<Vec<Tensor>> {
-        let mut builder = Runtime::builder();
-        builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
-        builder.install_extension_module(rem_extension::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        builder.install_extension_module(window_extension::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        builder.install_extension_module(relu_extension::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        builder.install_extension_module(dense_extension::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        builder.install_extension_module(xent_extension::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        builder.install_extension_module(tenferro_linalg::extension_module::<
-            tenferro_cpu::CpuEngine,
-        >(tenferro_cpu::runtime_engine_id()?)?)?;
-        let runtime = builder.build()?;
-        let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
-        let results = runtime.run(&mut [&mut *engine], &prepared, &[])?;
-        if results.len() != outputs.len() {
-            return Err("traced program returned the wrong number of outputs".into());
+/// A runtime on `engine` with every extension module of the bridge installed.
+fn build_runtime(engine: &mut tenferro_cpu::CpuEngine) -> FfiResult<tenferro_runtime::Runtime> {
+    let id = tenferro_cpu::runtime_engine_id()?;
+    let mut builder = tenferro_runtime::Runtime::builder();
+    builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
+    builder.install_extension_module(rem_extension::extension_module::<tenferro_cpu::CpuEngine>(id.clone())?)?;
+    builder.install_extension_module(window_extension::extension_module::<tenferro_cpu::CpuEngine>(id.clone())?)?;
+    builder.install_extension_module(relu_extension::extension_module::<tenferro_cpu::CpuEngine>(id.clone())?)?;
+    builder.install_extension_module(dense_extension::extension_module::<tenferro_cpu::CpuEngine>(id.clone())?)?;
+    builder.install_extension_module(xent_extension::extension_module::<tenferro_cpu::CpuEngine>(id.clone())?)?;
+    builder.install_extension_module(tenferro_linalg::extension_module::<tenferro_cpu::CpuEngine>(id)?)?;
+    Ok(builder.build()?)
+}
+
+/// The input tensors of `program` in program input order, or `None` when that order cannot be
+/// established.
+///
+/// Every input of a traced program is bound to a tensor: the leaves made from Julia arrays, and
+/// constants the AD transform adds. The program keeps them sorted by input slot. The order is
+/// accepted only when there is exactly one binding per input and every input that is one of the
+/// leaves among `nodes` finds exactly that leaf's tensor at its position. (Running a prepared
+/// program also checks the dtypes and shapes of its inputs.)
+fn traced_inputs<'a>(
+    program: &'a tenferro_runtime::CompiledGraph,
+    nodes: &[tenferro_runtime::TracedTensor],
+) -> FfiResult<Option<Vec<tenferro_tensor::TensorRead<'a>>>> {
+    let semantic = program.program();
+    let bound: Vec<_> = program.bindings().iter().map(|(_, value)| value).collect();
+    if bound.len() != semantic.inputs().len() || program.input_keys().len() != bound.len() {
+        return Ok(None);
+    }
+    let mut leaves = std::collections::HashMap::new();
+    for node in nodes {
+        if let (Some(key), Some(value)) = (node.input_key(), node.attached_value()) {
+            leaves.insert(key, std::sync::Arc::as_ptr(value));
         }
-        results
-            .into_iter()
-            .map(|output| Ok(output.into_tensor(engine)?))
-            .collect()
-    })
+    }
+    for (key, &value) in program.input_keys().iter().zip(&bound) {
+        if leaves.get(key).is_some_and(|&leaf| !std::ptr::eq(leaf, value)) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(bound.into_iter().map(|value| value.tensor_read()).collect::<Result<Vec<_>, _>>()?))
+}
+
+/// Compile `outputs` (nodes of a graph whose nodes are `nodes`) into one program and run it
+/// on the shared CPU engine, reusing the prepared program of an earlier graph of the same
+/// structure (see `traced_cache`).
+fn run_traced(
+    nodes: &[tenferro_runtime::TracedTensor],
+    outputs: &[&tenferro_runtime::TracedTensor],
+) -> FfiResult<Vec<Tensor>> {
+    let program = tenferro_runtime::GraphCompiler::new().compile_many(outputs)?;
+    let inputs = traced_inputs(&program, nodes)?;
+    let values = engine::with_engine_programs(|engine, programs| programs.run(engine, &program, inputs.as_deref()))?;
+    if values.len() != outputs.len() {
+        return Err("traced program returned the wrong number of outputs".into());
+    }
+    Ok(values)
+}
+
+/// Entries, hits and misses of the prepared traced program cache of the shared engine.
+#[julia]
+pub fn traced_cache_stats(out: &mut [u64]) -> Result<i32, String> {
+    let (entries, hits, misses) = engine::with_engine_programs(|_, programs| programs.stats());
+    if out.len() != 3 {
+        return Err("statistics buffer must have three entries".into());
+    }
+    out.copy_from_slice(&[entries as u64, hits, misses]);
+    Ok(0)
 }
 
 #[julia]
@@ -1260,7 +1295,7 @@ impl TracedGraph {
         let result = (|| -> FfiResult<()> {
             if !self.values.contains_key(&node) {
                 let tensor = self.nodes.get(node).ok_or("invalid node")?;
-                let value = run_traced(&[tensor])?.pop().ok_or("missing output")?;
+                let value = run_traced(&self.nodes, &[tensor])?.pop().ok_or("missing output")?;
                 self.values.insert(node, value);
             }
             copy_tensor(&self.values[&node], out, kind)
@@ -1317,7 +1352,7 @@ impl TracedGraph {
             }
             let tensors: Vec<&tenferro_runtime::TracedTensor> =
                 ids.iter().map(|&id| &self.nodes[id]).collect();
-            let values = run_traced(&tensors)?;
+            let values = run_traced(&self.nodes, &tensors)?;
             self.values.extend(ids.into_iter().zip(values));
             Ok(())
         })();
