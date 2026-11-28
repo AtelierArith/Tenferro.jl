@@ -9,12 +9,16 @@ TypedTensor
 AutoTenferro
 EagerContext
 EagerTensor
+EagerScalar
 AutoTenferroTraced
 TracedContext
 TracedTensor
 stopgrad
 constant
 context
+DifferentiableElement
+num_threads
+set_num_threads
 ```
 
 Element-type conversion and rounding use Base's functions on tensors: `S.(x)`,

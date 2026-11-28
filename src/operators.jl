@@ -122,7 +122,7 @@ function _broadcast_pair(a::_ADTensor, b::_ADTensor)
     a.graph === b.graph || throw(ArgumentError("tensors belong to different contexts"))
     promoted = promote_type(eltype(a), eltype(b))
     if eltype(a) !== eltype(b)
-        promoted <: ADElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
+        promoted <: DifferentiableElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
         a, b = _convert_tensor(a, promoted), _convert_tensor(b, promoted)
     end
     n = max(length(a.dims), length(b.dims))
@@ -324,13 +324,13 @@ function _factor(a::TracedTensor{T,2}, op) where {T}
 end
 _factor_tensor(a::EagerTensor, ::Type{T}, id, dims) where {T} = EagerTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 _factor_tensor(a::TracedTensor, ::Type{T}, id, dims) where {T} = TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
-function LinearAlgebra.svd(a::Union{EagerTensor{T,2},TracedTensor{T,2}}; full::Bool=false) where {T<:ADElement}
+function LinearAlgebra.svd(a::Union{EagerTensor{T,2},TracedTensor{T,2}}; full::Bool=false) where {T<:DifferentiableElement}
     full && throw(ArgumentError("full SVD is not supported for differentiation"))
     m, n = a.dims; k = min(m, n)
     id = _factor(a, 0)
     TensorSVD(_factor_tensor(a, T, id, (m,k)), _factor_tensor(a, typeof(real(zero(T))), id+1, (k,)), _factor_tensor(a, T, id+2, (k,n)))
 end
-function LinearAlgebra.qr(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:ADElement}
+function LinearAlgebra.qr(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:DifferentiableElement}
     m, n = a.dims; k = min(m, n)
     id = _factor(a, 1)
     TensorQR(_factor_tensor(a, T, id, (m,k)), _factor_tensor(a, T, id+1, (k,n)))
@@ -349,7 +349,7 @@ function _cat(first::_ADTensor, rest, dims)
     inputs = (first, rest...)
     promoted = promote_type(map(eltype, inputs)...)
     if any(a -> eltype(a) !== promoted, inputs)
-        promoted <: ADElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
+        promoted <: DifferentiableElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
         inputs = map(a -> _convert_tensor(a, promoted), inputs)
     end
     shape = ntuple(i -> i == dims ? sum(a -> a.dims[i], inputs) : first.dims[i], length(first.dims))
@@ -361,13 +361,13 @@ end
 
 Base.Broadcast.broadcasted(::typeof(clamp), a::_ADTensor, lo::Union{_ADTensor,Number,AbstractArray}, hi::Union{_ADTensor,Number,AbstractArray}) = Base.Broadcast.broadcasted(min, Base.Broadcast.broadcasted(max, a, lo), hi)
 
-function LinearAlgebra.cholesky(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:ADElement}
+function LinearAlgebra.cholesky(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:DifferentiableElement}
     a.dims[1] == a.dims[2] || throw(DimensionMismatch("cholesky requires a square matrix"))
     ishermitian(Array(a)) || throw(PosDefException(-1))
     TensorCholesky(_linalg_unary(a, 3, a.dims))
 end
 
-function LinearAlgebra.eigen(a::Union{EagerTensor{T,2},TracedTensor{T,2}}; sortby=LinearAlgebra.eigsortby) where {T<:ADElement}
+function LinearAlgebra.eigen(a::Union{EagerTensor{T,2},TracedTensor{T,2}}; sortby=LinearAlgebra.eigsortby) where {T<:DifferentiableElement}
     a.dims[1] == a.dims[2] || throw(DimensionMismatch("eigen requires a square matrix"))
     n = a.dims[1]
     id = _factor(a, 2)
@@ -375,16 +375,16 @@ function LinearAlgebra.eigen(a::Union{EagerTensor{T,2},TracedTensor{T,2}}; sortb
     _sort_eigen(TensorEigen(_factor_tensor(a, C, id, (n,)), _factor_tensor(a, C, id+1, (n,n))), sortby)
 end
 
-function LinearAlgebra.norm(a::EagerTensor{T}) where {T<:ADElement}
+function LinearAlgebra.norm(a::EagerTensor{T}) where {T<:DifferentiableElement}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.norm_node, UInt(a.id)))
     EagerScalar{typeof(real(zero(T))),typeof(a.graph)}(a.graph, id)
 end
-function LinearAlgebra.norm(a::TracedTensor{T}) where {T<:ADElement}
+function LinearAlgebra.norm(a::TracedTensor{T}) where {T<:DifferentiableElement}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_norm_node, UInt(a.id)))
     TracedTensor{typeof(real(zero(T))),0,typeof(a.graph)}(a.graph, id, ())
 end
 
-function LinearAlgebra.Hermitian(a::Union{EagerTensor{T,2},TracedTensor{T,2}}, uplo::Symbol=:U) where {T<:ADElement}
+function LinearAlgebra.Hermitian(a::Union{EagerTensor{T,2},TracedTensor{T,2}}, uplo::Symbol=:U) where {T<:DifferentiableElement}
     uplo in (:U, :L) || throw(ArgumentError("uplo must be :U or :L"))
     a.dims[1] == a.dims[2] || throw(DimensionMismatch("Hermitian requires a square matrix"))
     TensorHermitian(a, uplo)
@@ -404,7 +404,7 @@ end
 LinearAlgebra.cholesky(h::TensorHermitian) = TensorCholesky(_linalg_unary(_hermitian_matrix(h), 3, h.data.dims))
 
 
-function LinearAlgebra.lu(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:ADElement}
+function LinearAlgebra.lu(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:DifferentiableElement}
     m, n = a.dims; k = min(m, n)
     id = _factor(a, 4)
     TensorLU(_factor_tensor(a, T, id, (m,m)), _factor_tensor(a, T, id+1, (m,k)), _factor_tensor(a, T, id+2, (k,n)))
@@ -502,12 +502,12 @@ end
 
 function Base.:*(a::EagerTensor{T,2}, b::EagerTensor{S,2}) where {T,S}
     promoted = promote_type(T, S)
-    promoted <: ADElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
+    promoted <: DifferentiableElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
     _convert_tensor(a, promoted) * _convert_tensor(b, promoted)
 end
 function Base.:*(a::TracedTensor{T,2}, b::TracedTensor{S,2}) where {T,S}
     promoted = promote_type(T, S)
-    promoted <: ADElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
+    promoted <: DifferentiableElement || throw(ArgumentError("unsupported promoted tensor element type: $promoted"))
     _convert_tensor(a, promoted) * _convert_tensor(b, promoted)
 end
 

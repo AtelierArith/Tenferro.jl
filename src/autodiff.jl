@@ -1,7 +1,7 @@
 const DI = DifferentiationInterface
 
 const _Backend = Union{AutoTenferro,AutoTenferroTraced}
-const ADArray = AbstractArray{<:ADElement}
+const ADArray = AbstractArray{<:DifferentiableElement}
 # Differentiable inputs: supported arrays, or Tuple/NamedTuple trees of them.
 const _DiffInput = Union{ADArray,Tuple,NamedTuple}
 const _Constants = Vararg{DI.Constant}

@@ -34,3 +34,30 @@ function _close_state(state::_RustState)
     end
     return nothing
 end
+
+"""
+    Tenferro.num_threads() -> Int
+
+Number of CPU worker threads tenferro-rs kernels run on.
+
+All tenferro-rs operations of the process share one CPU execution engine, which keeps its
+buffer pool and kernel plan cache between calls. Its thread count is taken from the
+`TENFERRO_NUM_THREADS` environment variable when the engine is first used (default `1`,
+serial) and can be changed with [`Tenferro.set_num_threads`](@ref).
+"""
+num_threads() = Int(RustCrate.num_threads())
+
+"""
+    Tenferro.set_num_threads(n::Integer) -> Int
+
+Run tenferro-rs kernels on `n ≥ 1` CPU worker threads (`1` is serial) and return the new
+thread count. The shared engine is rebuilt with a new worker pool, so its buffer pool and
+kernel plan cache start empty. Tensors and contexts created before the change remain valid.
+
+Threaded kernels may sum in a different order than serial ones, so results can differ in
+the last bits. Julia threads that use tenferro concurrently take turns on the engine.
+"""
+function set_num_threads(n::Integer)
+    n >= 1 || throw(ArgumentError("number of threads must be at least 1, got $n"))
+    return Int(RustCrate.set_num_threads(UInt(n)))
+end

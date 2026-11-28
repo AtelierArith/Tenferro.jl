@@ -29,8 +29,16 @@ end
 EagerContext() = EagerContext(_RustState(RustCrate.EagerGraph()))
 Base.close(ctx::EagerContext) = _close_state(ctx.graph)
 
-const ADElement = Union{Float32,Float64,ComplexF32,ComplexF64}
-const TensorElement = Union{ADElement,Int32,Int64,Bool}
+"""
+    Tenferro.DifferentiableElement
+
+Element types that tenferro-rs can differentiate: `Union{Float32,Float64,ComplexF32,ComplexF64}`.
+Arrays with these element types are the differentiable inputs of [`AutoTenferro`](@ref) and
+[`AutoTenferroTraced`](@ref); tensors of other element types (`Int32`, `Int64`, `Bool`) are
+constants.
+"""
+const DifferentiableElement = Union{Float32,Float64,ComplexF32,ComplexF64}
+const TensorElement = Union{DifferentiableElement,Int32,Int64,Bool}
 
 function EagerTensor(ctx::EagerContext, x::AbstractArray{T,N}) where {T<:TensorElement,N}
     id = RustCall.result_to_exception(_rust_call(ctx.graph, RustCrate.input_array, _bytes(x), _dims(x), _typed_kind(T)))
@@ -38,6 +46,13 @@ function EagerTensor(ctx::EagerContext, x::AbstractArray{T,N}) where {T<:TensorE
     return EagerTensor{T,N,typeof(ctx.graph)}(ctx.graph, id, size(x))
 end
 
+"""
+    EagerScalar{T}
+
+A rank-0 eager result, such as the value of `sum(x)` or `x[i]` for an [`EagerTensor`](@ref).
+It takes part in arithmetic with tensors and numbers like a scalar; `s[]` returns its value
+as a `T`. A scalar belongs to the same context as the tensors it was computed from.
+"""
 struct EagerScalar{T,G}
     graph::G
     id::Int64
