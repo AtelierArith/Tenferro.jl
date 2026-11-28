@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  statuses: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -22,5 +26,8 @@ jobs:
         run: julia --project -e 'using Pkg; Pkg.instantiate(; workspace=true)'
       - name: Test
         run: julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'
-      - name: Build documentation
+      - name: Build and deploy documentation
         run: julia --project=docs docs/make.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && secrets.DOCUMENTER_KEY || '' }}

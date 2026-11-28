@@ -21,3 +21,12 @@ makedocs(;
     ],
     checkdocs = :exports,
 )
+
+DocumenterVitepress.deploydocs(;
+    repo = "github.com/AtelierArith/Tenferro.jl.git",
+    target = joinpath(@__DIR__, "build"),
+    branch = "gh-pages",
+    devbranch = "main",
+    devurl = "dev",
+    push_preview = false,
+)
