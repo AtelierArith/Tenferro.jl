@@ -164,6 +164,53 @@ end
     end
 end
 
+@testset "native window kernels: pushforwards, geometries and fallbacks" begin
+    # Central differences of `f` at `x` along `dx`.
+    fd_jvp(f, x, dx; h=1e-6) = (f(x .+ h .* dx) .- f(x .- h .* dx)) ./ (2h)
+    x, w = randn(7, 6, 3, 2), randn(3, 2, 3, 4)
+    dx, dw = randn(size(x)), randn(size(w))
+    cases = (
+        (a -> conv(a, w; stride=(2, 1), pad=(1, 0, 2, 1), dilation=(1, 2)), x, dx),
+        (b -> conv(x, b; pad=1, flipped=true), w, dw),
+        (a -> ∇conv_data(conv(a, w; stride=2), w, DenseConvDims(size(x), size(w); stride=2)), x, dx),
+        (a -> maxpool(a, (2, 2); pad=1, stride=1), x, dx),
+        (a -> meanpool(a, (3, 2); pad=(1, 0, 1, 1)), x, dx),
+        (a -> lpnormpool(a, 2, (2, 2)), abs.(x) .+ 0.1, dx),
+        (a -> relu.(a), x, dx),
+    )
+    for backend in BACKENDS, (f, a, da) in cases
+        (jvp,) = pushforward(f, backend, a, (da,))
+        @test jvp ≈ fd_jvp(f, a, da) rtol = 1e-5
+    end
+    # Geometries with equal shapes but different windows must not share
+    # compiled derivative programs.
+    for backend in BACKENDS, pad in ((1, 1, 1, 1), (2, 0, 0, 2), (0, 2, 2, 0))
+        loss(b) = sum(conv(x, b; pad=pad) .* reshape(1.0:prod(size(conv(x, w; pad=pad))), size(conv(x, w; pad=pad))))
+        @test gradient(loss, backend, w) ≈ FiniteDiff.finite_difference_gradient(loss, w) rtol = 1e-6
+    end
+    # Large enough for the kernels to split over the engine's threads.
+    xl, wl = randn(Float32, 30, 28, 4, 32), randn(Float32, 5, 5, 4, 6)
+    function cnn_loss(p)
+        h = relu.(conv(xl, p.w; pad=1))
+        sum(maxpool(h, (2, 2))) + sum(meanpool(h, (3, 3); stride=2, pad=1))
+    end
+    initial = Tenferro.num_threads()
+    try
+        Tenferro.set_num_threads(1)
+        expected = gradient(cnn_loss, AutoTenferro(), (w=wl,)).w
+        Tenferro.set_num_threads(4)
+        for backend in BACKENDS
+            @test gradient(cnn_loss, backend, (w=wl,)).w ≈ expected rtol = 1e-4
+        end
+    finally
+        Tenferro.set_num_threads(initial)
+    end
+    # Complex tensors take the composed (non-native) path.
+    xc, wc = randn(ComplexF64, 6, 6, 2, 2), randn(ComplexF64, 3, 3, 2, 3)
+    @test check_values((x, w) -> conv(x, w; pad=1, stride=2), xc, wc)
+    @test check_values(x -> meanpool(x, (2, 2)), xc)
+end
+
 @testset "upsampling and pixel shuffle" begin
     x = randn(4, 5, 2, 2)
     @test check_values(x -> upsample_nearest(x, (2, 3)), x)
