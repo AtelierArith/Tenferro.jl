@@ -1,7 +1,29 @@
+mod engine;
 mod rem_extension;
 
 use rustcall_julia_macros::julia;
-use tenferro_ad::{EagerRuntime, EagerTensor, Tensor};
+use tenferro_ad::{EagerRuntime, EagerSession, EagerTensor, Tensor};
+
+/// Run `f` in an eager session of `ctx` on the shared CPU engine.
+fn eager_session<T, E: From<tenferro_ad::Error>>(
+    ctx: &std::sync::Arc<EagerRuntime>,
+    f: impl FnOnce(&mut EagerSession<'_>) -> Result<T, E>,
+) -> Result<T, E> {
+    engine::with_engine(|engine| ctx.with_eager_session(engine, f))
+}
+
+/// Request `threads` CPU worker threads for tenferro-rs kernels (1 = serial).
+#[julia]
+pub fn set_num_threads(threads: usize) -> usize {
+    engine::set_threads(threads);
+    engine::engine_threads()
+}
+
+/// The number of CPU worker threads tenferro-rs kernels run on.
+#[julia]
+pub fn num_threads() -> usize {
+    engine::engine_threads()
+}
 
 type FfiResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -273,8 +295,7 @@ impl EagerGraph {
         let result = (|| -> FfiResult<()> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let node = self.nodes.get(node).ok_or("invalid node")?;
-            let mut engine = tenferro_cpu::CpuEngine::serial();
-            let value = ctx.with_eager_session(&mut engine, |s| s.duplicate_value(node))?;
+            let value = eager_session(ctx, |s| s.duplicate_value(node))?;
             copy_tensor(&value, out, kind)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
@@ -285,8 +306,7 @@ impl EagerGraph {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let input = self.nodes.get(node).ok_or("invalid input")?;
-            let mut engine = tenferro_cpu::CpuEngine::serial();
-            let value = ctx.with_eager_session(&mut engine, |s| s.duplicate_value(input))?;
+            let value = eager_session(ctx, |s| s.duplicate_value(input))?;
             Ok(ctx.variable_from(value)?)
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
@@ -300,7 +320,7 @@ impl EagerGraph {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let seed = self.nodes.get(seed).ok_or("invalid cotangent")?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+            Ok(eager_session(ctx, |s| {
                 s.vjp_optional(y, x, seed)
             })?)
         })();
@@ -318,7 +338,7 @@ impl EagerGraph {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let seed = self.nodes.get(seed).ok_or("invalid tangent")?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+            Ok(eager_session(ctx, |s| {
                 s.jvp_optional(y, x, seed)
             })?)
         })();
@@ -335,7 +355,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.neg(x),
                     1 => s.exp(x),
                     2 => s.log(x),
@@ -364,7 +384,7 @@ impl EagerGraph {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let dtype = any_dtype(kind)?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.cast(x, dtype)
                 })?,
             )
@@ -388,7 +408,7 @@ impl EagerGraph {
             let u = self.nodes.get(updates).ok_or("invalid updates")?;
             let config = scatter_axis_config(x.shape().len(), axis)?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.scatter(x, ix, u, config)
                 })?,
             )
@@ -405,7 +425,7 @@ impl EagerGraph {
             let ix = self.nodes.get(indices).ok_or("invalid indices")?;
             let config = gather_axis_config(x.shape(), axis)?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.gather(x, ix, config)
                 })?,
             )
@@ -422,7 +442,7 @@ impl EagerGraph {
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
             let dir = compare_dir(dir)?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.compare(a, b, dir)
                 })?,
             )
@@ -444,7 +464,7 @@ impl EagerGraph {
             let t = self.nodes.get(on_true).ok_or("invalid true branch")?;
             let f = self.nodes.get(on_false).ok_or("invalid false branch")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.where_select(c, t, f)
                 })?,
             )
@@ -458,7 +478,7 @@ impl EagerGraph {
         let result = (|| -> FfiResult<EagerTensor> {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| s.detach(x))?)
+            Ok(eager_session(ctx, |s| s.detach(x))?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -477,7 +497,7 @@ impl EagerGraph {
                 .map(|id| self.nodes.get(*id).ok_or("invalid input"))
                 .collect::<Result<_, _>>()?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.concatenate(&inputs, axis as isize)
                 })?,
             )
@@ -493,7 +513,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => {
                         let r = s.svd(x)?;
                         Ok::<_, tenferro_ad::Error>(vec![r.u, r.s, r.vh])
@@ -531,7 +551,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.norm(x)
                 })?,
             )
@@ -547,7 +567,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.det(x),
                     1 => s.inv(x),
                     2 => s.pinv(x),
@@ -572,7 +592,7 @@ impl EagerGraph {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+            Ok(eager_session(ctx, |s| {
                 if least_squares {
                     s.lstsq(a, b)
                 } else {
@@ -590,7 +610,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.tril(x, k),
                     1 => s.triu(x, k),
                     2 => s.extract_diag(x, 0, 1),
@@ -621,7 +641,7 @@ impl EagerGraph {
                 strides: bounds[2 * rank..].to_vec(),
             };
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.slice(x, config)
                 })?,
             )
@@ -641,7 +661,7 @@ impl EagerGraph {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let dims: Vec<usize> = (0..x.shape().len()).collect();
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.broadcast_in_dim(x, shape, &dims)
                 })?,
             )
@@ -662,7 +682,7 @@ impl EagerGraph {
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let axes: Vec<isize> = args.iter().map(|&axis| axis as isize).collect();
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.reshape(x, args),
                     1 => s.transpose(x, &axes),
                     2 => s.reduce_sum(x, Some(&axes)),
@@ -686,7 +706,7 @@ impl EagerGraph {
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.add(a, b),
                     1 => s.sub(a, b),
                     2 => s.mul(a, b),
@@ -731,7 +751,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let a = self.nodes.get(lhs).ok_or("invalid lhs")?;
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| s.matmul(a, b))?)
+            Ok(eager_session(ctx, |s| s.matmul(a, b))?)
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
         Ok(self.push(value))
@@ -743,7 +763,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.reduce_sum(x, None)
                 })?,
             )
@@ -758,7 +778,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| match op {
+                eager_session(ctx, |s| match op {
                     0 => s.sigmoid(x),
                     1 => s.silu(x),
                     2 => s.softplus(x),
@@ -778,7 +798,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     if log {
                         s.log_softmax(x, axis as isize)
                     } else {
@@ -797,7 +817,7 @@ impl EagerGraph {
             let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let config = pad_config(x.shape().len(), amounts)?;
-            Ok(ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| s.pad(x, config))?)
+            Ok(eager_session(ctx, |s| s.pad(x, config))?)
         })();
         let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
@@ -811,7 +831,7 @@ impl EagerGraph {
             let b = self.nodes.get(rhs).ok_or("invalid rhs")?;
             let config = dot_general_config(dims)?;
             Ok(
-                ctx.with_eager_session(&mut tenferro_cpu::CpuEngine::serial(), |s| {
+                eager_session(ctx, |s| {
                     s.dot_general(a, b, config)
                 })?,
             )
@@ -872,22 +892,20 @@ impl TracedGraph {
             use tenferro_runtime::{ExecutionEngine, GraphCompiler, Runtime};
             let tensor = self.nodes.get(node).ok_or("invalid node")?;
             let program = GraphCompiler::new().compile(tensor)?;
-            let mut engine = tenferro_cpu::CpuEngine::serial();
-            let mut builder = Runtime::builder();
-            builder.register_engine(tenferro_cpu::runtime_engine_registration(&engine)?)?;
-            builder.install_extension_module(rem_extension::extension_module::<
-                tenferro_cpu::CpuEngine,
-            >(tenferro_cpu::runtime_engine_id()?)?)?;
-            builder.install_extension_module(tenferro_linalg::extension_module::<
-                tenferro_cpu::CpuEngine,
-            >(tenferro_cpu::runtime_engine_id()?)?)?;
-            let runtime = builder.build()?;
-            let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
-            let mut outputs = runtime.run(&mut [&mut engine], &prepared, &[])?;
-            let value = outputs
-                .pop()
-                .ok_or("missing output")?
-                .into_tensor(&mut engine)?;
+            let value = engine::with_engine(|engine| -> FfiResult<Tensor> {
+                let mut builder = Runtime::builder();
+                builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
+                builder.install_extension_module(rem_extension::extension_module::<
+                    tenferro_cpu::CpuEngine,
+                >(tenferro_cpu::runtime_engine_id()?)?)?;
+                builder.install_extension_module(tenferro_linalg::extension_module::<
+                    tenferro_cpu::CpuEngine,
+                >(tenferro_cpu::runtime_engine_id()?)?)?;
+                let runtime = builder.build()?;
+                let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
+                let mut outputs = runtime.run(&mut [&mut *engine], &prepared, &[])?;
+                Ok(outputs.pop().ok_or("missing output")?.into_tensor(engine)?)
+            })?;
             copy_tensor(&value, out, kind)
         })();
         result.map(|_| 0).map_err(|err| err.to_string())

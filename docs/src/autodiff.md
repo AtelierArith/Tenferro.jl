@@ -100,7 +100,7 @@ julia> gradient(x -> sum(x .* Tenferro.stopgrad(x)), AutoTenferro(), [1.0, 2.0])
 
 ## Scalar results
 
-An eager scalar result (for example `sum(x)`) is read with `s[]`, `only(s)`, `convert(Float64, s)` or `Float64(s)`; `Array(s)` returns a zero-dimensional array. Zero-dimensional traced tensors support `only`, `convert` and the same constructors, each of which executes the graph.
+An eager scalar result, an [`EagerScalar`](@ref) (for example `sum(x)`), is read with `s[]`, `only(s)`, `convert(Float64, s)` or `Float64(s)`; `Array(s)` returns a zero-dimensional array. Zero-dimensional traced tensors support `only`, `convert` and the same constructors, each of which executes the graph.
 
 ## Current scope
 

@@ -80,7 +80,7 @@ _lift_tensor(ref::_ADTensor, x::AbstractArray, ::Type{T}) where {T} = _constant_
 function _lift(ref::_ADTensor, x, ::Type{T}, dims) where {T}
     t = _lift_tensor(ref, x, T)
     if eltype(t) !== T
-        T <: ADElement || throw(ArgumentError("cannot convert $(eltype(t)) operand to $T"))
+        T <: DifferentiableElement || throw(ArgumentError("cannot convert $(eltype(t)) operand to $T"))
         t = _convert_tensor(t, T)
     end
     _broadcast_to(t, dims)

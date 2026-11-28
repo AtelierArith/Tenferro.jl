@@ -120,7 +120,7 @@ dimensions, matching tenferro-rs `dot_general`.
 function _dot_general(a::_ADTensor, b::_ADTensor, lc, rc, lb=(), rb=())
     _same_graph(a, b)
     T = promote_type(eltype(a), eltype(b))
-    T <: ADElement || throw(ArgumentError("unsupported promoted tensor element type: $T"))
+    T <: DifferentiableElement || throw(ArgumentError("unsupported promoted tensor element type: $T"))
     a, b = _convert_tensor(a, T), _convert_tensor(b, T)
     length(lc) == length(rc) || throw(ArgumentError("contracting dimension lists must have equal length"))
     length(lb) == length(rb) || throw(ArgumentError("batch dimension lists must have equal length"))

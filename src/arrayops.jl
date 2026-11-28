@@ -112,7 +112,7 @@ for TT in (:EagerTensor, :TracedTensor)
 end
 
 # Promotions (e.g. `Float32` with `Float64`) go through the same explicit cast.
-_convert_tensor(a::_ADTensor, ::Type{S}) where {S<:ADElement} = _cast(a, S)
+_convert_tensor(a::_ADTensor, ::Type{S}) where {S<:DifferentiableElement} = _cast(a, S)
 
 # Rounding ------------------------------------------------------------------------
 

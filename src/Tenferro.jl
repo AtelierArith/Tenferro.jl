@@ -7,11 +7,11 @@ import ADTypes
 using ADTypes: AbstractADType
 import DifferentiationInterface
 
-public stopgrad, constant, context
+public stopgrad, constant, context, DifferentiableElement, num_threads, set_num_threads
 
-export TypedTensor, AutoTenferro, EagerContext, EagerTensor, AutoTenferroTraced, TracedContext, TracedTensor
+export TypedTensor, AutoTenferro, EagerContext, EagerTensor, EagerScalar, AutoTenferroTraced, TracedContext, TracedTensor
 
-const RustCrate = @rust_crate joinpath(@__DIR__, "..", "deps", "rust")
+@rust_crate joinpath(@__DIR__, "..", "deps", "rust") submodule="RustCrate"
 
 include("ffi.jl")
 include("types.jl")

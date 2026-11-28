@@ -64,7 +64,7 @@ value, g = value_and_gradient(loss, AutoTenferro(), ps, Constant([1.0, 2.0]))
 # g.weight, g.bias
 ```
 
-Use `Tenferro.stopgrad(x)` (or `ChainRulesCore.ignore_derivatives(x)`) to block gradient flow. Scalar results are read with `s[]`, `only(s)` or `Float64(s)`.
+Use `Tenferro.stopgrad(x)` (or `ChainRulesCore.ignore_derivatives(x)`) to block gradient flow. Eager scalar results (`EagerScalar`, for example from `sum(x)`) are read with `s[]`, `only(s)` or `Float64(s)`. `Tenferro.DifferentiableElement` is the union of differentiable element types (`Float32`, `Float64`, `ComplexF32`, `ComplexF64`).
 
 Seeds and tangents must match the corresponding value's shape and element type. Complex cotangents use the real Hermitian inner-product convention; a complex scalar gradient is a VJP with seed `one(eltype(output))`. See the [autodiff guide](docs/src/autodiff.md) for details.
 
@@ -73,6 +73,21 @@ Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `Complex
 Element types are converted with broadcasting, as in `Float32.(x)` or `Float64.(x .> 0)` (differentiable between floating-point and complex types). Conversions follow Julia: `Int64.(x)` and `Bool.(x)` throw `InexactError` on an eager tensor whose values are not exactly representable, and are rejected with an `ArgumentError` on a traced tensor; use `trunc.(Int64, x)`, `round.(Int64, x)` (ties to even), `floor.(Int64, x)`, `ceil.(Int64, x)` or `x .!= 0` instead. `trunc.`, `floor.`, `ceil.` and `round.` also round floating-point tensors, with a zero derivative. Inside a differentiated function, `Tenferro.constant(x, array)` creates a constant tensor in the context of `x` (`Tenferro.context(x)` returns that context), and plain arrays can be mixed with tensors in arithmetic and in `cat`/`hcat`/`vcat`. `vec`, `repeat`, `sum(f, x; dims)`-style mapped reductions, `count`/`any`/`all` and sums of `Bool` tensors, n-ary `max.`/`min.`/`+`/`*`, and `muladd.`/`fma.` are also supported.
 
 Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. Broadcasting any other function, including an anonymous function, throws an `ArgumentError` naming it; `(f ∘ g).(x...)` is expanded to `f.(g.(x...))`. Prepared calls and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
+
+## Performance
+
+All tenferro-rs operations of a process run on one shared CPU engine, which keeps its buffer pool and kernel plan cache between calls. The engine is serial by default. Set `TENFERRO_NUM_THREADS=n` before the first operation, or call `Tenferro.set_num_threads(n)`, to run kernels on `n` worker threads. `Tenferro.num_threads()` reports the current count. Threaded kernels may round differently from serial ones.
+
+Medians for one MNIST training step (`TenferroLux.withgradient`, batch 128, Float32; the MLP is 784→128→64→10, the CNN has two conv/max-pool layers):
+
+| Step | before | shared engine, serial | 4 threads | Zygote |
+|:--|--:|--:|--:|--:|
+| MLP, `AutoTenferro` | 38.7 ms | 23.1 ms | 24.3 ms | 2.2 ms |
+| MLP, `AutoTenferroTraced` | 19.1 ms | 21.0 ms | 19.4 ms | |
+| CNN, `AutoTenferro` | 265 ms | 202 ms | 162 ms | 31 ms |
+| CNN, `AutoTenferroTraced` | 274 ms | 205 ms | 115 ms | |
+
+See the [performance guide](docs/src/performance.md) for micro benchmarks and the cost of each call.
 
 ## Tensor types
 
