@@ -70,7 +70,7 @@ Seeds and tangents must match the corresponding value's shape and element type. 
 
 Supported differentiable inputs are CPU arrays of `Float32`, `Float64`, `ComplexF32`, and `ComplexF64`. Supported operations include arithmetic broadcast, comparisons and `ifelse` selection, elementwise mathematical functions, reductions (including `var`/`std`), shape, concatenation, slicing and integer-vector indexing operations, and selected linear algebra. See the [autodiff guide](docs/src/autodiff.md) for the current list and limitations.
 
-Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. General Julia broadcast functions, prepared calls, and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
+Arbitrary Julia functions are supported only when their tensor operations are supported by Tenferro. Broadcasting any other function, including an anonymous function, throws an `ArgumentError` naming it; `(f ∘ g).(x...)` is expanded to `f.(g.(x...))`. Prepared calls and higher-order derivatives are not yet supported. Defining an `rrule` does not make an arbitrary Julia function traceable by `AutoTenferro()`.
 
 ## Tensor types
 
@@ -103,9 +103,28 @@ _, dx1, dx2 = back(EagerTensor(ctx, ones(2, 2)))
 
 The pullbacks return `EagerTensor` cotangents. Compatibility with a particular external AD engine is not guaranteed. This extension is separate from Tenferro's own `AutoTenferro()` backend.
 
+## Optional NNlib extension
+
+Loading NNlib.jl together with Tenferro activates the `TenferroNNlibExt` package extension, so the NNlib operations that Lux.jl layers use work on `EagerTensor` and `TracedTensor` and can be differentiated by `AutoTenferro()` and `AutoTenferroTraced()`:
+
+- activation broadcasts such as `relu.(x)`, `gelu.(x)`, `swish.(x)`, `sigmoid.(x)`, `softplus.(x)` and `leakyrelu.(x, 0.2)`, plus `NNlib.fast_act(f, x)`. Derivatives at kinks follow NNlib's ChainRules (for example `relu'(0) == 0`);
+- `softmax`, `logsoftmax` and `logsumexp` with `dims`;
+- `batched_mul` (`⊠`), `batched_transpose` and `batched_adjoint`;
+- `pad_zeros` and `pad_constant`.
+
+```julia
+using Tenferro, NNlib, DifferentiationInterface
+
+layer(p, x) = sum(softmax(relu.(p.W * x .+ p.b); dims=1) .* [1.0, 2.0])
+ps = (W = [1.0 -2.0; 0.5 1.5], b = [0.1, -0.3])
+value, g = value_and_gradient(layer, AutoTenferro(), ps, Constant([1.0, 2.0]))
+```
+
+Convolution, pooling, upsampling, normalization and dropout are not yet provided.
+
 ## Tests and documentation
 
-Run the test suite with `julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'`. Tests use ParallelTestRunner, Aqua, JET, and FiniteDiff.
+Run the test suite with `julia --project -e 'using Pkg; Pkg.test(; test_args=["--jobs=2"])'`. Tests use ParallelTestRunner, Aqua, JET, FiniteDiff, and NNlib.
 
 Build the DocumenterVitepress documentation locally with:
 

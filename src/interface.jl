@@ -111,6 +111,14 @@ for op in (:+, :-, :*, :/, :^, :rem, :max, :min)
             Base.Broadcast.broadcasted($op, a, _scalar_tensor_value(b))
         Base.Broadcast.broadcasted(::typeof($op), a::EagerScalar, b::EagerTensor) =
             Base.Broadcast.broadcasted($op, _scalar_tensor_value(a), b)
+        Base.Broadcast.broadcasted(::typeof($op), a::EagerScalar, b::AbstractArray) =
+            Base.Broadcast.broadcasted($op, _scalar_tensor_value(a), b)
+        Base.Broadcast.broadcasted(::typeof($op), a::AbstractArray, b::EagerScalar) =
+            Base.Broadcast.broadcasted($op, a, _scalar_tensor_value(b))
+        Base.Broadcast.broadcasted(::typeof($op), a::EagerScalar, b::Union{EagerScalar,Number}) =
+            _scalar_result(Base.Broadcast.broadcasted($op, _scalar_tensor_value(a), _operand_tensor(_scalar_tensor_value(a), b)))
+        Base.Broadcast.broadcasted(::typeof($op), a::Number, b::EagerScalar) =
+            _scalar_result(Base.Broadcast.broadcasted($op, _operand_tensor(_scalar_tensor_value(b), a), _scalar_tensor_value(b)))
     end
 end
 

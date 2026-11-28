@@ -88,8 +88,34 @@ inputs to these eight mathematical functions are rejected rather than
 implicitly converted to floating-point; explicitly convert the input first.
 
 `exp(A)` is a matrix function and is not provided by these elementwise methods.
-`erf` and SpecialFunctions.jl integration are outside the current supported
-surface; no SpecialFunctions dependency or extension is installed.
+Loading SpecialFunctions.jl enables `erf.(x)` for real tensors through a
+package extension.
+
+## Broadcast fallback
+
+Only the functions listed in this guide are lowered to tenferro-rs. Broadcasting any other function over a tensor, including an anonymous function or a closure, throws an `ArgumentError` that names the function; write its body as separate dotted operations. `(f ∘ g).(x...)` is expanded to `f.(g.(x...))`, and `identity.(x)` returns `x`. An `EagerScalar` broadcasts with tensors, numbers and constant arrays.
+
+## Neural-network operations
+
+These operations are available after `using NNlib` (package extension `TenferroNNlibExt`), for eager and traced tensors, and are differentiable by both backends.
+
+| NNlib function | Implementation and derivative at kinks |
+|---|---|
+| `sigmoid`/`σ`, `sigmoid_fast`, `softplus`, `swish`, `gelu`/`gelu_tanh`, `gelu_erf` | tenferro-rs activation kernels (overflow-free `sigmoid` and `softplus`) |
+| `relu`, `relu6`, `trelu` | `select`; derivative `0` at every kink |
+| `leakyrelu(x, a=0.01)` | `select`; derivative `a` at `0` |
+| `elu(x, α=1)`, `celu(x, α=1)`, `selu` | `select` with `expm1`; `elu'(0) == celu'(0) == 1`, `selu'(0) == λα` |
+| `hardσ`, `hardtanh`, `softshrink(x, λ=0.5)` | `select`; derivative `0` at the kinks |
+| `hardswish` | `x .* hardσ.(x)` with NNlib's derivative `x/3 + 1/2` on `[-3, 3]` |
+| `logσ`, `softsign`, `mish`, `lisht`, `tanhshrink`, `logcosh`, `tanh_fast`, `gelu_sigmoid`, `quick_gelu` | composed from the smooth operations above |
+
+The activations accept `Float32` and `Float64` tensors, and eager scalars. `leakyrelu`, `elu`, `celu`, `softshrink` and `trelu` also accept their parameter as a constant real number, as in `leakyrelu.(x, 0.2)`. `rrelu` (random) is not provided. `NNlib.fast_act(f, x)` returns `f` for tensors. Unlike NNlib's `tanh_fast` and `sigmoid_fast`, the tensor versions are not approximations, so `Float32` results can differ from NNlib's in the last few bits.
+
+`softmax(x; dims=1)`, `logsoftmax(x; dims=1)` and `logsumexp(x; dims=:)` accept an integer, a tuple of dimensions or `:`. For a single dimension, softmax and logsoftmax use the tenferro-rs kernels; otherwise they are composed from `maximum`, `exp`, `sum` and `log`, shifted by the maximum along `dims`.
+
+`batched_mul(A, B)` (`A ⊠ B`) multiplies the matrices `A[:, :, k]` and `B[:, :, k]` through tenferro-rs `dot_general` with a batch dimension. It follows NNlib: a 3-D operand with batch size one is reused for every batch, a matrix operand multiplies every batch, and higher-rank operands with equal trailing dimensions are reshaped to one batch dimension. Either operand may be a constant Julia array. `batched_transpose` and `batched_adjoint` return permuted (and, for complex tensors, conjugated) tensors, not lazy wrappers.
+
+`pad_zeros(x, pad; dims=:)` and `pad_constant(x, pad, val=0; dims=:)` follow NNlib's padding arguments: an integer, one amount per padded dimension, a `(low, high)` amount pair per padded dimension, or a tuple of `(low, high)` pairs. They use tenferro-rs `pad`; a nonzero `val` adds a constant frame. Negative padding (cropping) is not supported.
 
 ## Reductions
 
