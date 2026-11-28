@@ -1146,13 +1146,14 @@ dependencies = [
 
 [[package]]
 name = "tenferro-ad"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "computegraph",
  "lru",
  "num-complex",
  "num-traits",
  "tenferro-cpu",
+ "tenferro-internal-extension-macros",
  "tenferro-internal-ops",
  "tenferro-runtime",
  "tenferro-tensor",
@@ -1161,11 +1162,11 @@ dependencies = [
 
 [[package]]
 name = "tenferro-core-ops"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "tenferro-cpu"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "cpueinsum",
  "elem-simd-math",
@@ -1190,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-cpu-basic"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -1201,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-cpu-fused"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -1214,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-internal-cpu-kernels"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -1228,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-internal-extension-macros"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1237,7 +1238,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-internal-ops"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "computegraph",
  "num-complex",
@@ -1262,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-linalg"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "computegraph",
  "num-complex",
@@ -1282,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-runtime"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "computegraph",
  "lru",
@@ -1298,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-tensor"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "num-complex",
  "num-traits",
@@ -1310,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "tenferro-tensor-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "num-complex",
  "strided-view",

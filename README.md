@@ -2,9 +2,10 @@
 
 Tenferro.jl is an experimental Julia interface to [tenferro-rs](https://github.com/tensor4all/tenferro-rs). It uses RustCall.jl to run tensor operations and exposes tenferro-rs automatic differentiation through DifferentiationInterface.jl.
 
-The bundled tenferro-rs submodule is pinned to the 0.11.0 release commit
-(`cef3746f`, tagged `tenferro-ad-v0.11.0`). The Rust bridge uses its
-semantic-program AD APIs and the threadteam 0.5 CPU dependency stack.
+The bundled tenferro-rs submodule is pinned to the 0.12.0 release commit
+(`d48982d3`, tagged `v0.12.0`). The Rust bridge uses the 0.12 one-call-grammar
+APIs, its semantic-program AD APIs, and the single faer-backed CPU dependency
+stack (`threadteam` 0.5).
 
 ## Setup
 
