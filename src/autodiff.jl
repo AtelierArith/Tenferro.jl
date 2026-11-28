@@ -38,12 +38,21 @@ _array_leaves(x::ADArray) = (x,)
 _array_leaves(x::Union{Tuple,NamedTuple}) = _concat(map(_array_leaves, Tuple(x))...)
 _array_leaves(x) = ()
 
-function _record(backend::_Backend, f::F, x, contexts) where {F}
+# Run `f` on tensors of a new context and pass the context, the input tensors and the output
+# to `body`. The context is closed when `body` returns or anything throws: its tenferro-rs
+# graph is freed at once instead of whenever Julia's GC finalizes it. (Live eager graphs
+# share one runtime, whose reverse passes scan every live tensor, so graphs left for the GC
+# make later steps slower.) Tensors of the context must not be used after the call.
+function _record(body::B, backend::_Backend, f::F, x, contexts) where {B,F}
     ctx = _new_context(backend)
-    inputs = _tree_inputs(ctx, x)
-    output = f(inputs, map(DI.unwrap, contexts)...)
-    _check_output(ctx, output)
-    return ctx, inputs, output
+    try
+        inputs = _tree_inputs(ctx, x)
+        output = f(inputs, map(DI.unwrap, contexts)...)
+        _check_output(ctx, output)
+        return body(ctx, inputs, output)
+    finally
+        close(ctx)
+    end
 end
 
 _check_output(ctx::EagerContext, y::Union{EagerTensor,EagerScalar}) =
@@ -105,11 +114,12 @@ function _forward(ctx, output, input, seed)
 end
 
 function _gradient(backend::_Backend, f::F, x, contexts, want_value::Bool) where {F}
-    ctx, inputs, output = _record(backend, f, x, contexts)
-    _is_scalar(output) || throw(ArgumentError("gradient requires a scalar output"))
-    seed = _seed(ctx, fill(one(eltype(output))))
-    grads = _reverse(ctx, output, inputs, seed, want_value)
-    return (want_value ? _value(output) : nothing), grads
+    _record(backend, f, x, contexts) do ctx, inputs, output
+        _is_scalar(output) || throw(ArgumentError("gradient requires a scalar output"))
+        seed = _seed(ctx, fill(one(eltype(output))))
+        grads = _reverse(ctx, output, inputs, seed, want_value)
+        return (want_value ? _value(output) : nothing), grads
+    end
 end
 
 function _check_seed(output, seed::AbstractArray)
@@ -126,15 +136,21 @@ end
 _check_seed(output, seed) = throw(ArgumentError("seed must be a supported array or number"))
 
 function _pullback(backend::_Backend, f::F, x, seeds::Tuple, contexts, want_value::Bool) where {F}
-    ctx, inputs, output = _record(backend, f, x, contexts)
-    grads = map(seeds) do seed
-        _reverse(ctx, output, inputs, _seed(ctx, _check_seed(output, seed)), want_value)
+    _record(backend, f, x, contexts) do ctx, inputs, output
+        grads = map(seeds) do seed
+            _reverse(ctx, output, inputs, _seed(ctx, _check_seed(output, seed)), want_value)
+        end
+        return (want_value ? _value(output) : nothing), grads
     end
-    return (want_value ? _value(output) : nothing), grads
 end
 
 function _pushforward(backend::_Backend, f::F, x, tangents::Tuple, contexts, want_value::Bool) where {F}
-    ctx, inputs, output = _record(backend, f, x, contexts)
+    _record(backend, f, x, contexts) do ctx, inputs, output
+        _pushforward(ctx, inputs, output, tangents, want_value)
+    end
+end
+
+function _pushforward(ctx, inputs, output, tangents::Tuple, want_value::Bool)
     leaves = _tensor_leaves(inputs)
     dims = _output_size(output)
     results = map(tangents) do tangent

@@ -28,9 +28,12 @@ function _rust_call(state::_RustState, f, args...)
     end
 end
 
+# Closing frees the Rust object now rather than when the GC finalizes it.
 function _close_state(state::_RustState)
     lock(state.lock) do
+        value = state.value
         state.value = nothing
+        isnothing(value) || finalize(value)
     end
     return nothing
 end

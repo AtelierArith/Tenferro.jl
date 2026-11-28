@@ -32,6 +32,11 @@ the recorded computation and the shapes and element types of its inputs, not the
 A second `gradient` call on the same function with new data of the same shapes therefore
 reuses the compiled reverse pass, even when the function is a new closure.
 
+Each DifferentiationInterface call closes its context before it returns, which frees the
+tenferro-rs graph at once. Contexts left for Julia's garbage collector would stay registered
+in the shared runtime, and every reverse pass scans the tensors of all live contexts, so
+steps would get slower until a collection runs.
+
 Gradients, and each seed of a pullback, are computed for all inputs in one reverse pass. On
 the traced backend, the value and all gradients are compiled and run as one program. A
 `TracedContext` keeps the value of every node it has evaluated until it is closed, so

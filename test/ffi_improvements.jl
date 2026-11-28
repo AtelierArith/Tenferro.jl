@@ -1,4 +1,5 @@
 using Test, Tenferro
+using DifferentiationInterface: gradient, pullback, pushforward
 
 @testset "Rust errors and context synchronization" begin
     ctx = EagerContext()
@@ -28,6 +29,20 @@ end
         @test_throws ArgumentError Array(x)
         @test_throws ArgumentError TensorType(ctx, ones(2, 2))
         @test Array(TensorType(Context(), ones(1, 1))) == ones(1, 1)
+    end
+end
+
+@testset "DifferentiationInterface calls close their context" begin
+    for backend in (AutoTenferro(), AutoTenferroTraced())
+        captured = Ref{Any}(nothing)
+        g = gradient(x -> (captured[] = x; sum(x .* x)), backend, [1.0, 2.0])
+        @test g == [2.0, 4.0]
+        @test_throws ArgumentError Array(captured[])
+        # Contexts are closed when the differentiated function throws as well.
+        @test_throws ErrorException gradient(x -> (captured[] = x; error("boom")), backend, [1.0])
+        @test_throws ArgumentError Array(captured[])
+        @test only(pullback(x -> x .* 3.0, backend, [1.0], ([1.0],))) == [3.0]
+        @test only(pushforward(x -> x .* 3.0, backend, [1.0], ([1.0],))) == [3.0]
     end
 end
 
