@@ -229,6 +229,71 @@ fn dot_general_config(dims: &[usize]) -> FfiResult<tenferro_ad::DotGeneralConfig
     })
 }
 
+/// The AD context with tenferro-linalg and remainder rules, shared by all traced graphs so
+/// its AD transform cache persists across calls.
+fn ad_context() -> FfiResult<&'static tenferro_ad::AdContext> {
+    static AD: std::sync::OnceLock<Result<tenferro_ad::AdContext, String>> = std::sync::OnceLock::new();
+    AD.get_or_init(|| {
+        (|| -> FfiResult<tenferro_ad::AdContext> {
+            Ok(tenferro_ad::AdContext::builder()
+                .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
+                .with_semantic_extension_rules(rem_extension::rules()?)?
+                .build()?)
+        })()
+        .map_err(|err| err.to_string())
+    })
+    .as_ref()
+    .map_err(|err| err.clone().into())
+}
+
+/// The eager runtime shared by all eager graphs of the process.
+///
+/// Its prepared-derivative and AD transform caches (bounded by tenferro-ad's default
+/// limits) persist across contexts, so repeated differentiation of the same computation
+/// reuses compiled derivative programs. Each `EagerGraph` still owns its own nodes.
+fn shared_runtime() -> Result<std::sync::Arc<EagerRuntime>, String> {
+    static RUNTIME: std::sync::OnceLock<Result<std::sync::Arc<EagerRuntime>, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            ad_context()
+                .and_then(|ad| Ok(EagerRuntime::with_ad_context(ad)?))
+                .map_err(|err| err.to_string())
+        })
+        .clone()
+}
+
+/// Prepared-derivative cache statistics of the shared eager runtime:
+/// `[entries, hits, misses]`.
+#[julia]
+pub fn derivative_cache_stats(out: &mut [u64]) -> Result<i32, String> {
+    let stats = shared_runtime()?.cache_stats().map_err(|err| err.to_string())?;
+    let p = stats.prepared_derivatives;
+    let values = [p.entries as u64, p.hits, p.misses];
+    if out.len() != values.len() {
+        return Err("statistics buffer must have three entries".into());
+    }
+    out.copy_from_slice(&values);
+    Ok(0)
+}
+
+/// Copy an accumulated eager gradient into an owned column-major tensor.
+fn gradient_tensor(grad: &tenferro_ad::GradientValue) -> FfiResult<Tensor> {
+    let shape = grad.shape().to_vec();
+    macro_rules! copy {
+        ($ty:ty) => {
+            Tensor::from_vec_col_major(shape, grad.as_slice::<$ty>()?.to_vec())?
+        };
+    }
+    Ok(match grad.dtype() {
+        tenferro_ad::DType::F32 => copy!(f32),
+        tenferro_ad::DType::F64 => copy!(f64),
+        tenferro_ad::DType::C32 => copy!(num_complex::Complex32),
+        tenferro_ad::DType::C64 => copy!(num_complex::Complex64),
+        _ => return Err("unsupported gradient element type".into()),
+    })
+}
+
 #[julia]
 pub struct EagerGraph {
     ctx: Option<std::sync::Arc<EagerRuntime>>,
@@ -240,14 +305,7 @@ pub struct EagerGraph {
 impl EagerGraph {
     #[julia]
     pub fn new() -> Self {
-        let runtime = (|| -> FfiResult<std::sync::Arc<EagerRuntime>> {
-            let ad = tenferro_ad::AdContext::builder()
-                .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
-                .with_semantic_extension_rules(rem_extension::rules()?)?
-                .build()?;
-            Ok(EagerRuntime::with_ad_context(&ad)?)
-        })();
-        match runtime {
+        match shared_runtime() {
             Ok(ctx) => Self {
                 ctx: Some(ctx),
                 init_error: String::new(),
@@ -255,7 +313,7 @@ impl EagerGraph {
             },
             Err(err) => Self {
                 ctx: None,
-                init_error: err.to_string(),
+                init_error: err,
                 nodes: Vec::new(),
             },
         }
@@ -282,6 +340,24 @@ impl EagerGraph {
             })
         })();
         let value = result.map_err(|err: Box<dyn std::error::Error>| err.to_string())?;
+        Ok(self.push(value))
+    }
+
+    /// Like `input_array`, but the tensor is an untracked leaf: no gradient is accumulated
+    /// for it and it is not a target of reverse passes.
+    #[julia]
+    pub fn constant_array(
+        &mut self,
+        data: &[u8],
+        shape: &[usize],
+        kind: i32,
+    ) -> Result<i64, String> {
+        let result = (|| -> FfiResult<EagerTensor> {
+            let tensor = input_tensor(data, shape, kind)?;
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            Ok(ctx.constant_from(tensor)?)
+        })();
+        let value = result.map_err(|err| err.to_string())?;
         Ok(self.push(value))
     }
 
@@ -329,6 +405,64 @@ impl EagerGraph {
             Ok(None) => Ok(-2),
             Err(err) => Err(err.to_string()),
         }
+    }
+
+    /// Reverse-mode derivatives of `output` with respect to every node in `inputs`, from one
+    /// reverse pass. Writes one node id per input to `out` (`-2`: no dependency).
+    #[julia]
+    pub fn vjp_nodes(
+        &mut self,
+        output: usize,
+        inputs: &[usize],
+        seed: usize,
+        out: &mut [i64],
+    ) -> Result<i32, String> {
+        let result = (|| -> FfiResult<Vec<Option<EagerTensor>>> {
+            if out.len() != inputs.len() {
+                return Err("output id buffer does not match the inputs".into());
+            }
+            let ctx = self.ctx.as_ref().ok_or_else(|| self.init_error.as_str())?;
+            let y = self.nodes.get(output).ok_or("invalid output")?;
+            let seed = self.nodes.get(seed).ok_or("invalid cotangent")?;
+            let xs = inputs
+                .iter()
+                .map(|&id| self.nodes.get(id).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            for x in &xs {
+                x.clear_grad()?;
+            }
+            // `backward_with` differentiates every reachable tracked leaf in one pass. It
+            // fails without accumulating when a reachable leaf has no cotangent flow (for
+            // example through an integer cast); the per-leaf VJPs report that as `None`.
+            if eager_session(ctx, |s| s.backward_with(y, seed)).is_ok() {
+                let grads = xs
+                    .iter()
+                    .map(|x| -> FfiResult<Option<EagerTensor>> {
+                        x.grad()?
+                            .map(|grad| Ok(ctx.constant_from(gradient_tensor(&grad)?)?))
+                            .transpose()
+                    })
+                    .collect::<FfiResult<Vec<_>>>();
+                for x in &xs {
+                    x.clear_grad()?;
+                }
+                // A gradient that cannot be read back falls through to the per-leaf VJPs.
+                if let Ok(grads) = grads {
+                    return Ok(grads);
+                }
+            }
+            xs.iter()
+                .map(|x| Ok(eager_session(ctx, |s| s.vjp_optional(y, x, seed))?))
+                .collect()
+        })();
+        let grads = result.map_err(|err| err.to_string())?;
+        for (slot, grad) in out.iter_mut().zip(grads) {
+            *slot = match grad {
+                Some(value) => self.push(value),
+                None => -2,
+            };
+        }
+        Ok(0)
     }
 
     #[julia]
@@ -849,10 +983,38 @@ impl EagerGraph {
     }
 }
 
+/// Compile `outputs` into one program and run it on the shared CPU engine.
+fn run_traced(outputs: &[&tenferro_runtime::TracedTensor]) -> FfiResult<Vec<Tensor>> {
+    use tenferro_runtime::{ExecutionEngine, GraphCompiler, Runtime};
+    let program = GraphCompiler::new().compile_many(outputs)?;
+    engine::with_engine(|engine| -> FfiResult<Vec<Tensor>> {
+        let mut builder = Runtime::builder();
+        builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
+        builder.install_extension_module(rem_extension::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        builder.install_extension_module(tenferro_linalg::extension_module::<
+            tenferro_cpu::CpuEngine,
+        >(tenferro_cpu::runtime_engine_id()?)?)?;
+        let runtime = builder.build()?;
+        let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
+        let results = runtime.run(&mut [&mut *engine], &prepared, &[])?;
+        if results.len() != outputs.len() {
+            return Err("traced program returned the wrong number of outputs".into());
+        }
+        results
+            .into_iter()
+            .map(|output| Ok(output.into_tensor(engine)?))
+            .collect()
+    })
+}
+
 #[julia]
 pub struct TracedGraph {
     trace: tenferro_runtime::TraceContext,
     nodes: Vec<tenferro_runtime::TracedTensor>,
+    /// Values of evaluated nodes. Traced nodes are immutable, so a value never goes stale.
+    values: std::collections::HashMap<usize, Tensor>,
 }
 
 #[julia]
@@ -862,6 +1024,7 @@ impl TracedGraph {
         Self {
             trace: tenferro_runtime::TraceContext::new(),
             nodes: Vec::new(),
+            values: std::collections::HashMap::new(),
         }
     }
 
@@ -883,30 +1046,74 @@ impl TracedGraph {
 
     #[julia]
     pub fn traced_copy_array(
-        &self,
+        &mut self,
         node: usize,
         out: &mut [u8],
         kind: i32,
     ) -> Result<i32, String> {
         let result = (|| -> FfiResult<()> {
-            use tenferro_runtime::{ExecutionEngine, GraphCompiler, Runtime};
-            let tensor = self.nodes.get(node).ok_or("invalid node")?;
-            let program = GraphCompiler::new().compile(tensor)?;
-            let value = engine::with_engine(|engine| -> FfiResult<Tensor> {
-                let mut builder = Runtime::builder();
-                builder.register_engine(tenferro_cpu::runtime_engine_registration(engine)?)?;
-                builder.install_extension_module(rem_extension::extension_module::<
-                    tenferro_cpu::CpuEngine,
-                >(tenferro_cpu::runtime_engine_id()?)?)?;
-                builder.install_extension_module(tenferro_linalg::extension_module::<
-                    tenferro_cpu::CpuEngine,
-                >(tenferro_cpu::runtime_engine_id()?)?)?;
-                let runtime = builder.build()?;
-                let prepared = runtime.prepare(&program, &[], &[engine.target()])?;
-                let mut outputs = runtime.run(&mut [&mut *engine], &prepared, &[])?;
-                Ok(outputs.pop().ok_or("missing output")?.into_tensor(engine)?)
-            })?;
-            copy_tensor(&value, out, kind)
+            if !self.values.contains_key(&node) {
+                let tensor = self.nodes.get(node).ok_or("invalid node")?;
+                let value = run_traced(&[tensor])?.pop().ok_or("missing output")?;
+                self.values.insert(node, value);
+            }
+            copy_tensor(&self.values[&node], out, kind)
+        })();
+        result.map(|_| 0).map_err(|err| err.to_string())
+    }
+
+    /// Reverse-mode derivatives of `output` with respect to every node in `inputs`, traced as
+    /// one transformation. Writes one node id per input to `out` (`-2`: no dependency).
+    #[julia]
+    pub fn traced_vjp_nodes(
+        &mut self,
+        output: usize,
+        inputs: &[usize],
+        seed: usize,
+        out: &mut [i64],
+    ) -> Result<i32, String> {
+        let result = (|| -> FfiResult<Vec<Option<tenferro_runtime::TracedTensor>>> {
+            if out.len() != inputs.len() {
+                return Err("output id buffer does not match the inputs".into());
+            }
+            let y = self.nodes.get(output).ok_or("invalid output")?;
+            let seed = self.nodes.get(seed).ok_or("invalid seed")?;
+            let xs = inputs
+                .iter()
+                .map(|&id| self.nodes.get(id).ok_or("invalid input"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ad_context()?.vjp_many(y, &xs, seed)?)
+        })();
+        let grads = result.map_err(|err| err.to_string())?;
+        for (slot, grad) in out.iter_mut().zip(grads) {
+            *slot = match grad {
+                Some(value) => self.push(value),
+                None => -2,
+            };
+        }
+        Ok(0)
+    }
+
+    /// Compile and run the given nodes as one program and keep their values, so later
+    /// `traced_copy_array` calls on them do not compile again.
+    #[julia]
+    pub fn traced_evaluate(&mut self, nodes: &[usize]) -> Result<i32, String> {
+        let result = (|| -> FfiResult<()> {
+            let mut ids: Vec<usize> = Vec::with_capacity(nodes.len());
+            for &id in nodes {
+                if !self.values.contains_key(&id) && !ids.contains(&id) {
+                    self.nodes.get(id).ok_or("invalid node")?;
+                    ids.push(id);
+                }
+            }
+            if ids.is_empty() {
+                return Ok(());
+            }
+            let tensors: Vec<&tenferro_runtime::TracedTensor> =
+                ids.iter().map(|&id| &self.nodes[id]).collect();
+            let values = run_traced(&tensors)?;
+            self.values.extend(ids.into_iter().zip(values));
+            Ok(())
         })();
         result.map(|_| 0).map_err(|err| err.to_string())
     }
@@ -1308,10 +1515,7 @@ impl TracedGraph {
             let y = self.nodes.get(output).ok_or("invalid output")?;
             let x = self.nodes.get(input).ok_or("invalid input")?;
             let seed = self.nodes.get(seed).ok_or("invalid seed")?;
-            let ad = tenferro_ad::AdContext::builder()
-                .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
-                .with_semantic_extension_rules(rem_extension::rules()?)?
-                .build()?;
+            let ad = ad_context()?;
             Ok(if forward {
                 ad.jvp_optional(y, x, seed)?
             } else {
@@ -1331,10 +1535,7 @@ impl TracedGraph {
             (|| {
                 let y = self.nodes.get(output).ok_or("invalid output")?;
                 let x = self.nodes.get(input).ok_or("invalid input")?;
-                let ad = tenferro_ad::AdContext::builder()
-                    .with_semantic_extension_rules(tenferro_linalg::semantic_ad_rules()?)?
-                    .with_semantic_extension_rules(rem_extension::rules()?)?
-                    .build()?;
+                let ad = ad_context()?;
                 Ok(ad.grad_optional(y, x)?)
             })();
         match result {

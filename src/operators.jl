@@ -161,7 +161,7 @@ end
 function _scalar_tensor(a::EagerTensor{T}, b::Number) where {T}
     S = promote_type(T, typeof(b))
     S <: TensorElement || throw(ArgumentError("unsupported promoted tensor element type: $S"))
-    EagerTensor(EagerContext(a.graph), fill(convert(S, b), a.dims))
+    _constant_tensor(a, fill(convert(S, b), a.dims))
 end
 function _scalar_tensor(a::TracedTensor{T}, b::Number) where {T}
     S = promote_type(T, typeof(b))
@@ -412,10 +412,15 @@ end
 
 Base.:\(a::EagerTensor{T,2}, b::EagerTensor{T,1}) where {T} = reshape(a \ reshape(b, (b.dims[1], 1)), (a.dims[2],))
 Base.:\(a::TracedTensor{T,2}, b::TracedTensor{T,1}) where {T} = reshape(a \ reshape(b, (b.dims[1], 1)), (a.dims[2],))
-Base.:\(a::EagerTensor{T,2}, b::AbstractArray{T,N}) where {T,N} = a \ EagerTensor(EagerContext(a.graph), b)
+Base.:\(a::EagerTensor{T,2}, b::AbstractArray{T,N}) where {T,N} = a \ _constant_tensor(a, b)
 Base.:\(a::TracedTensor{T,2}, b::AbstractArray{T,N}) where {T,N} = a \ TracedTensor(TracedContext(a.graph), b)
 
-_constant_tensor(a::EagerTensor, b::AbstractArray{T}) where {T<:TensorElement} = EagerTensor(EagerContext(a.graph), b)
+# An untracked eager leaf: no gradient is accumulated for it and reverse passes skip it.
+function _eager_constant(graph, b::AbstractArray{T,N}) where {T<:TensorElement,N}
+    id = RustCall.result_to_exception(_rust_call(graph, RustCrate.constant_array, _bytes(b), _dims(b), _typed_kind(T)))
+    return EagerTensor{T,N,typeof(graph)}(graph, id, size(b))
+end
+_constant_tensor(a::EagerTensor, b::AbstractArray{T}) where {T<:TensorElement} = _eager_constant(a.graph, b)
 _constant_tensor(a::TracedTensor, b::AbstractArray{T}) where {T<:TensorElement} = TracedTensor(TracedContext(a.graph), b)
 for op in (:+, :-, :*, :/, :^, :rem, :max, :min)
     @eval begin
