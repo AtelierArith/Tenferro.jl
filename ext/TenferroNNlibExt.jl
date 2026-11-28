@@ -108,4 +108,112 @@ function NNlib.pad_constant(x::_ADTensor, pad::Union{Int,Tuple}, val=0; dims=:)
 end
 NNlib.pad_zeros(x::_ADTensor, pad; dims=:) = NNlib.pad_constant(x, pad, 0; dims=dims)
 
+# Convolution ------------------------------------------------------------------------------
+
+const _Arg = Union{_ADTensor,AbstractArray}
+const _P = Tenferro
+
+_lo(c) = ntuple(d -> NNlib.padding(c)[2d - 1], NNlib.spatial_dims(c))
+_hi(c) = ntuple(d -> NNlib.padding(c)[2d], NNlib.spatial_dims(c))
+
+_conv_cdims(x, w, cdims::DenseConvDims) =
+    _P._conv(x, w, NNlib.stride(cdims), _lo(cdims), _hi(cdims), NNlib.dilation(cdims),
+             NNlib.groupcount(cdims), !NNlib.flipkernel(cdims))
+NNlib.conv(x::_ADTensor, w::_Arg, cdims::DenseConvDims; kwargs...) = _conv_cdims(x, w, cdims)
+NNlib.conv(x::AbstractArray, w::_ADTensor, cdims::DenseConvDims; kwargs...) = _conv_cdims(x, w, cdims)
+
+function _conv_kw(x, w; stride=1, pad=0, dilation=1, flipped=false, groups=1)
+    S = ndims(w) - 2
+    cdims = DenseConvDims(size(x), size(w); stride=NNlib.expand(Val(S), stride), padding=NNlib.expand(Val(S), pad),
+                          dilation=NNlib.expand(Val(S), dilation), flipkernel=flipped, groups=groups)
+    _conv_cdims(x, w, cdims)
+end
+NNlib.conv(x::_ADTensor, w::_ADTensor; kwargs...) = _conv_kw(x, w; kwargs...)
+NNlib.conv(x::_ADTensor, w::AbstractArray; kwargs...) = _conv_kw(x, w; kwargs...)
+NNlib.conv(x::AbstractArray, w::_ADTensor; kwargs...) = _conv_kw(x, w; kwargs...)
+
+function _depthwise_kw(x, w; stride=1, pad=0, dilation=1, flipped=false)
+    S = ndims(w) - 2
+    cdims = DepthwiseConvDims(size(x), size(w); stride=NNlib.expand(Val(S), stride), padding=NNlib.expand(Val(S), pad),
+                              dilation=NNlib.expand(Val(S), dilation), flipkernel=flipped)
+    NNlib.depthwiseconv(x, w, cdims)
+end
+NNlib.depthwiseconv(x::_ADTensor, w::_ADTensor; kwargs...) = _depthwise_kw(x, w; kwargs...)
+NNlib.depthwiseconv(x::_ADTensor, w::AbstractArray; kwargs...) = _depthwise_kw(x, w; kwargs...)
+NNlib.depthwiseconv(x::AbstractArray, w::_ADTensor; kwargs...) = _depthwise_kw(x, w; kwargs...)
+
+_conv_data_cdims(dy, w, cdims::DenseConvDims) =
+    _P._conv_data(dy, w, NNlib.input_size(cdims), NNlib.stride(cdims), _lo(cdims), _hi(cdims),
+                  NNlib.dilation(cdims), NNlib.groupcount(cdims), !NNlib.flipkernel(cdims))
+NNlib.∇conv_data(dy::_ADTensor, w::_Arg, cdims::DenseConvDims; kwargs...) = _conv_data_cdims(dy, w, cdims)
+NNlib.∇conv_data(dy::AbstractArray, w::_ADTensor, cdims::DenseConvDims; kwargs...) = _conv_data_cdims(dy, w, cdims)
+
+_conv_filter_cdims(x, dy, cdims::DenseConvDims) =
+    _P._conv_filter(x, dy, NNlib.kernel_size(cdims), NNlib.stride(cdims), _lo(cdims), NNlib.dilation(cdims),
+                    NNlib.groupcount(cdims), !NNlib.flipkernel(cdims))
+NNlib.∇conv_filter(x::_ADTensor, dy::_Arg, cdims::DenseConvDims; kwargs...) = _conv_filter_cdims(x, dy, cdims)
+NNlib.∇conv_filter(x::AbstractArray, dy::_ADTensor, cdims::DenseConvDims; kwargs...) = _conv_filter_cdims(x, dy, cdims)
+
+# Depthwise kernels `(kernel..., C_mult, C_in)` are grouped kernels `(kernel..., 1, C_mult * C_in)`.
+_grouped(w) = reshape(w, (size(w)[1:(end - 2)]..., 1, size(w, ndims(w) - 1) * size(w, ndims(w))))
+NNlib.depthwiseconv(x::_ADTensor, w::_Arg, cdims::DepthwiseConvDims; kwargs...) = _conv_cdims(x, _grouped(w), DenseConvDims(cdims))
+NNlib.depthwiseconv(x::AbstractArray, w::_ADTensor, cdims::DepthwiseConvDims; kwargs...) =
+    _conv_cdims(x, _grouped(w), DenseConvDims(cdims))
+NNlib.∇depthwiseconv_data(dy::_ADTensor, w::_Arg, cdims::DepthwiseConvDims; kwargs...) =
+    _conv_data_cdims(dy, _grouped(w), DenseConvDims(cdims))
+NNlib.∇depthwiseconv_data(dy::AbstractArray, w::_ADTensor, cdims::DepthwiseConvDims; kwargs...) =
+    _conv_data_cdims(dy, _grouped(w), DenseConvDims(cdims))
+function _depthwise_filter(x, dy, cdims::DepthwiseConvDims)
+    dw = _conv_filter_cdims(x, dy, DenseConvDims(cdims))
+    reshape(dw, (NNlib.kernel_size(cdims)..., NNlib.channel_multiplier(cdims), NNlib.channels_in(cdims)))
+end
+NNlib.∇depthwiseconv_filter(x::_ADTensor, dy::_Arg, cdims::DepthwiseConvDims; kwargs...) = _depthwise_filter(x, dy, cdims)
+NNlib.∇depthwiseconv_filter(x::AbstractArray, dy::_ADTensor, cdims::DepthwiseConvDims; kwargs...) = _depthwise_filter(x, dy, cdims)
+
+NNlib.DenseConvDims(x::_ADTensor, w::_Arg; kwargs...) = DenseConvDims(size(x), size(w); kwargs...)
+NNlib.DenseConvDims(x::AbstractArray, w::_ADTensor; kwargs...) = DenseConvDims(size(x), size(w); kwargs...)
+NNlib.DepthwiseConvDims(x::_ADTensor, w::_Arg; kwargs...) = DepthwiseConvDims(size(x), size(w); kwargs...)
+NNlib.DepthwiseConvDims(x::AbstractArray, w::_ADTensor; kwargs...) = DepthwiseConvDims(size(x), size(w); kwargs...)
+
+# Pooling -----------------------------------------------------------------------------------
+
+NNlib.PoolDims(x::_ADTensor, k; kwargs...) = PoolDims(size(x), k; kwargs...)
+
+_pool(x, mode, pdims::PoolDims; kwargs...) =
+    _P._pool(x, mode, NNlib.kernel_size(pdims), NNlib.stride(pdims), _lo(pdims), _hi(pdims),
+             NNlib.dilation(pdims), NNlib.output_size(pdims); kwargs...)
+NNlib.maxpool(x::_ADTensor, pdims::PoolDims; kwargs...) = _pool(x, :max, pdims)
+NNlib.meanpool(x::_ADTensor, pdims::PoolDims; count_include_pad::Bool=true, kwargs...) =
+    _pool(x, :mean, pdims; count_include_pad=count_include_pad)
+function NNlib.lpnormpool(x::_ADTensor, pdims::PoolDims; p, kwargs...)
+    (isinf(p) || p < 0) && error("p value of Lp norm pool expects `0 < p < Inf`, but p is $(p) now.")
+    _pool(x, :lpnorm, pdims; p=p)
+end
+
+# Upsampling ---------------------------------------------------------------------------------
+
+NNlib.upsample_nearest(x::_ADTensor, scales::NTuple{S,Integer}) where {S} =
+    (S in 1:ndims(x) || throw(ArgumentError("can't upsample ndims(x)=$(ndims(x)) with scale=$scales"));
+     _P._upsample_nearest(x, scales))
+function NNlib.upsample_nearest(x::_ADTensor; size::NTuple{S,Int}) where {S}
+    xsize = Base.size(x)[1:S]
+    all(size .% xsize .== 0) || throw(ArgumentError("expected output size divisible by input size"))
+    _P._upsample_nearest(x, size .÷ xsize)
+end
+
+function NNlib.upsample_linear(x::_ADTensor, scale::NTuple{M,Real}; align_corners::Bool=true) where {M}
+    N = ndims(x)
+    M == N - 2 || error("The scale argument should be an NTuple with length $(N - 2), but it has length $M.")
+    NNlib.upsample_linear(x; size=ntuple(i -> floor(Int, scale[i] * Base.size(x, i)), N - 2), align_corners)
+end
+NNlib.upsample_linear(x::_ADTensor, scale::Real; align_corners::Bool=true) =
+    NNlib.upsample_linear(x, ntuple(_ -> scale, ndims(x) - 2); align_corners)
+function NNlib.upsample_linear(x::_ADTensor; size::Union{Integer,NTuple{<:Any,Integer}}, align_corners::Bool=true)
+    length(size) == ndims(x) - 2 ||
+        error("The scale argument should be an NTuple with length $(ndims(x) - 2), but it has length $(length(size)).")
+    _P._upsample_linear(x, Tuple(size); align_corners)
+end
+
+NNlib.pixel_shuffle(x::_ADTensor, r::Integer) = _P._pixel_shuffle(x, r)
+
 end

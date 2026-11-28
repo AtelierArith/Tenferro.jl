@@ -117,9 +117,30 @@ The activations accept `Float32` and `Float64` tensors, and eager scalars. `leak
 
 `pad_zeros(x, pad; dims=:)` and `pad_constant(x, pad, val=0; dims=:)` follow NNlib's padding arguments: an integer, one amount per padded dimension, a `(low, high)` amount pair per padded dimension, or a tuple of `(low, high)` pairs. They use tenferro-rs `pad`; a nonzero `val` adds a constant frame. Negative padding (cropping) is not supported.
 
+### Convolution, pooling and upsampling
+
+tenferro-rs has no convolution or `reduce_window` primitive, so these functions are composed from its `pad`, `slice`, `concatenate`, `dot_general`, reduction and `select` kernels. They follow NNlib's WHCN layout, `(spatial..., channels, batch)` with one to three spatial dimensions, and NNlib's argument conventions; gradients are those of the composed kernels.
+
+| NNlib function | Implementation |
+|---|---|
+| `conv(x, w; stride, pad, dilation, flipped, groups)`, `conv(x, w, ::DenseConvDims)` | zero `pad`, one strided `slice` per kernel offset concatenated into windows (im2col), then one `dot_general` over kernel offsets and input channels; groups are a `dot_general` batch dimension |
+| `depthwiseconv(x, w; ...)`, `depthwiseconv(x, w, ::DepthwiseConvDims)` | grouped `conv` with `groups = C_in` |
+| `∇conv_data(dy, w, cdims)`, `∇depthwiseconv_data` | transposed convolution: `conv` of `dy` with interior (stride) padding and the channel-swapped kernel reversed once more |
+| `∇conv_filter(x, dy, cdims)`, `∇depthwiseconv_filter` | windows of `x` contracted with `dy` |
+| `maxpool(x, k; pad, stride, ceil_mode)`, `maxpool(x, ::PoolDims)` | running maximum over one strided slice per kernel offset of the input padded with `-Inf`, updated by `select` only where an entry is strictly larger, so each window's gradient goes to its first maximum in kernel order, as in NNlib's `∇maxpool` |
+| `meanpool(x, k; pad, stride, count_include_pad, ceil_mode)`, `meanpool(x, ::PoolDims)` | window sums divided by NNlib's per-window count: all window positions inside the padded input, or only those inside the input with `count_include_pad=false` |
+| `lpnormpool(x, p, k; pad, stride, ceil_mode)`, `lpnormpool(x, ::PoolDims; p)` | `(∑ xᵢ^p)^(1/p)` over each window (padding contributes nothing) |
+| `upsample_nearest(x, scales)`, `upsample_nearest(x; size)` | `broadcast_to` of a reshaped tensor |
+| `upsample_linear`, `upsample_bilinear`, `upsample_trilinear` (scale or `size`, both `align_corners`) | one pair of axis `gather`s with constant interpolation weights per resized dimension (NNlib's source positions) |
+| `pixel_shuffle(x, r)` | `reshape` and `permutedims` |
+
+`PoolDims`, `DenseConvDims` and `DepthwiseConvDims` accept tensors in place of arrays. Either operand of `conv`, `depthwiseconv`, `∇conv_data` and `∇conv_filter` may be a constant Julia array. `maximum` and `minimum` accept `init` (Lux's `GlobalMaxPool` calls `maximum(x; dims, init=-Inf)`), so Lux's global and adaptive pooling layers work. Convolution windows are built from `sum(kernel)` slices and concatenations (one per kernel offset and dimension); mean and Lp pooling sum `prod(kernel)` output-sized slices, or reshape and reduce when the windows do not overlap (stride equal to the kernel size). Anti-aliased bilinear upsampling, `upsample_bicubic` and complex inputs are not provided.
+
 ## Reductions
 
-`sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean` accept `dims`.
+`sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean` accept `dims`;
+`prod`, `maximum` and `minimum` also accept `init`, combined with the result by
+one more `*`, `max` or `min`.
 `Statistics.var` and `Statistics.std` accept `dims`, `corrected` and a
 precomputed `mean`; they are composed from `mean`, `abs2` and `sum`.
 Without `dims`, they reduce all elements to a scalar. With `dims`, Julia
