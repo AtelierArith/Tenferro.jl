@@ -54,6 +54,54 @@ true
 
 For tuple inputs, each tangent has the same tuple structure as the input. Multiple tangent directions can be passed in the outer tuple.
 
+## Values, constants and parameter structures
+
+`value_and_gradient`, `value_and_pullback` and `value_and_pushforward` return the primal value together with the derivatives. DifferentiationInterface `Constant` context arguments are passed to the function unchanged and are not differentiated:
+
+```jldoctest
+julia> using Tenferro, DifferentiationInterface
+
+julia> value_and_gradient((x, c) -> sum(x .* c), AutoTenferro(), [1.0, 2.0], Constant([3.0, 4.0]))
+(11.0, [3.0, 4.0])
+```
+
+The active input can be a nested `Tuple`/`NamedTuple` tree of supported arrays, such as a Lux.jl parameter tree. Gradients and pullbacks return the same structure; pushforward tangents must follow it. Leaves that are not supported floating-point arrays are passed to the function unchanged and receive `nothing`, while empty `NamedTuple()`/`()` leaves round-trip:
+
+```jldoctest
+julia> using Tenferro, DifferentiationInterface
+
+julia> ps = (layer_1 = (weight = [1.0 2.0; 3.0 4.0], bias = [0.5, -1.0]), layer_2 = NamedTuple());
+
+julia> g = gradient(p -> sum(p.layer_1.weight * p.layer_1.bias), AutoTenferro(), ps);
+
+julia> g.layer_1.weight
+2×2 Matrix{Float64}:
+ 0.5  -1.0
+ 0.5  -1.0
+
+julia> g.layer_2
+NamedTuple()
+```
+
+Both backends report `ADTypes.mode(backend) == ADTypes.ReverseMode()` and do not support in-place (`f!(y, x)`) functions. Prepared calls (`prepare_gradient` and the `prep` argument) are not specialized.
+
+## Stopping gradients
+
+[`Tenferro.stopgrad`](@ref) returns a value that derivatives treat as a constant. Eager tensors use the backend's `detach`; traced tensors are evaluated and reinserted as constant graph inputs. With ChainRulesCore loaded, `ChainRulesCore.ignore_derivatives(x)` calls `stopgrad` for Tenferro tensors (the function form `ignore_derivatives(f)` simply runs `f`).
+
+```jldoctest
+julia> using Tenferro, DifferentiationInterface
+
+julia> gradient(x -> sum(x .* Tenferro.stopgrad(x)), AutoTenferro(), [1.0, 2.0])
+2-element Vector{Float64}:
+ 1.0
+ 2.0
+```
+
+## Scalar results
+
+An eager scalar result (for example `sum(x)`) is read with `s[]`, `only(s)`, `convert(Float64, s)` or `Float64(s)`; `Array(s)` returns a zero-dimensional array. Zero-dimensional traced tensors support `only`, `convert` and the same constructors, each of which executes the graph.
+
 ## Current scope
 
 See [Operation contracts](operations.md) for type, axis, ownership, domain,
@@ -65,12 +113,13 @@ The backend accepts CPU arrays with `Float32`, `Float64`, `ComplexF32` or `Compl
 
 Supported eager and traced operations include:
 
-- Elementwise broadcast of `+`, `-`, `*`, `/`, `^`, `rem`, `min`, `max`, `clamp`, `abs`, `sign`, `conj`, `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `expm1`, and `log1p`; unary `-`, and scalar multiplication and division. Mixed floating-point and complex tensor operands are promoted according to Julia rules when the resulting type is supported.
-- `sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean`, with or without `dims`.
-- `reshape`, `permutedims`, vector or matrix `transpose` and `adjoint`, `reverse`, `cat` along one existing dimension, and indexing with one integer, nonempty positive-step integer range, or `:` per dimension. One-dimensional tensors also accept vectors of integer indices.
+- Elementwise broadcast of `+`, `-`, `*`, `/`, `^`, `rem`, `min`, `max`, `clamp`, `abs`, `abs2`, `inv`, `sign`, `conj`, `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `expm1`, and `log1p`; unary `-`, and scalar multiplication and division. Mixed floating-point and complex tensor operands are promoted according to Julia rules when the resulting type is supported.
+- Comparisons `.==`, `.!=`, `.<`, `.<=`, `.>`, `.>=` producing non-differentiable `Bool` tensors, `.!` on `Bool` tensors, and `ifelse.(mask, a, b)`, which is differentiable in its tensor branches.
+- `sum`, `prod`, `maximum`, `minimum`, and `Statistics.mean`, with or without `dims`; `Statistics.var` and `Statistics.std` with `dims`, `corrected` and `mean` keywords.
+- `reshape`, `dropdims`, `permutedims`, vector or matrix `transpose` and `adjoint`, `reverse`, `cat` (including a new trailing dimension), `vcat`, `hcat`, `selectdim`, `eachslice`, `zero`, `copy`, and indexing with one integer, nonempty positive-step integer range, `:`, integer vector, or Boolean mask per dimension.
 - Matrix multiplication and matrix–vector `*`, `\` (including tall rectangular least-squares problems), `inv`, `pinv`, `det`, `norm`, thin `svd`, `qr`, `lu`, `eigen`, `cholesky`, `tril`, `triu`, `LowerTriangular`/`UpperTriangular` solves, and `diag` for nonempty diagonals. Decompositions return Tenferro-specific result types, rather than Julia standard factorization types. `svd` exposes `U`/`S`/`Vt`/`V`, `qr` exposes `Q`/`R`, `lu` exposes `P`/`L`/`U`, `eigen` exposes `values`/`vectors`, and `cholesky` exposes `L`/`U`. For real inputs `eigen(A)` returns complex-valued eigenvalues and eigenvectors; `eigen(Hermitian(A))` returns real eigenvalues and uses the triangle specified by `Hermitian`. By default `eigen` materializes eigenvalues to determine Julia-compatible sorting; `sortby=nothing` preserves the backend order without that sorting. Derivatives at repeated eigenvalues may be undefined.
 
-`cholesky(A)` materializes the input to check Hermitian symmetry; `cholesky(Hermitian(A))` uses the specified triangle. For `rem.(x, y)`, a Tenferro.jl Rust extension supplies JVP and VJP rules: away from quotient discontinuities, the derivatives are `1` with respect to `x` and `-div(x, y)` (quotient rounded toward zero) with respect to `y`. The derivative is undefined at nonzero integer quotient boundaries and when the divisor is zero. Complex `sign` is differentiated as `z / abs(z)` for nonzero `z`; its derivative is undefined at zero. Singular solves and inverses report tenferro-rs errors; numerical factorization failures are propagated. Derivatives of decompositions can be undefined or ill-conditioned at singular or repeated values, and available derivatives depend on tenferro-rs. Full SVD, arbitrary broadcast functions, general indexing, prepared calls, and higher derivatives are not yet supported. For empty inputs, reductions use Julia’s empty-array semantics: `sum` and `prod` use their identities, `mean` yields NaN where an empty slice is reduced, and `maximum`/`minimum` throw when an output slice has no elements. Empty `sum` and `prod` have empty input gradients. Functions must use supported Tenferro operations; defining an `rrule` for an arbitrary Julia function does not make it traceable.
+`cholesky(A)` materializes the input to check Hermitian symmetry; `cholesky(Hermitian(A))` uses the specified triangle. For `rem.(x, y)`, a Tenferro.jl Rust extension supplies JVP and VJP rules: away from quotient discontinuities, the derivatives are `1` with respect to `x` and `-div(x, y)` (quotient rounded toward zero) with respect to `y`. The derivative is undefined at nonzero integer quotient boundaries and when the divisor is zero. Complex `sign` is differentiated as `z / abs(z)` for nonzero `z`; its derivative is undefined at zero. Singular solves and inverses report tenferro-rs errors; numerical factorization failures are propagated. Derivatives of decompositions can be undefined or ill-conditioned at singular or repeated values, and available derivatives depend on tenferro-rs. Full SVD, arbitrary broadcast functions, linear indexing of matrices, prepared calls, and higher derivatives are not yet supported. Complex `abs2` is computed as `abs.(z).^2`, whose derivative is undefined at zero. For empty inputs, reductions use Julia’s empty-array semantics: `sum` and `prod` use their identities, `mean` yields NaN where an empty slice is reduced, and `maximum`/`minimum` throw when an output slice has no elements. Empty `sum` and `prod` have empty input gradients. Functions must use supported Tenferro operations; defining an `rrule` for an arbitrary Julia function does not make it traceable.
 
 For real tensors, `log` and `sqrt` at negative inputs, and `log1p` below -1, return NaN from the backend; Julia scalar functions throw `DomainError` for those inputs. At the real boundary, `log(0)` and `log1p(-1)` produce negative infinity, and `sqrt(0)` produces zero. Derivatives at singularities and outside the real domain should not be assumed finite. Complex functions use the backend's complex arithmetic and derivatives; branch cuts and singularities remain subject to their mathematical restrictions.
 
@@ -114,7 +163,7 @@ Loading `ChainRulesCore` together with Tenferro activates the `TenferroChainRule
 
 ## Traced graphs
 
-`TracedTensor` builds a tenferro-rs computation graph. Construct tensors in the same `TracedContext`; converting a result to `Array` compiles and executes its graph on the CPU. `sum` produces a zero-dimensional traced tensor, whose result is read with `Array(result)[]`.
+`TracedTensor` builds a tenferro-rs computation graph. Construct tensors in the same `TracedContext`; converting a result to `Array` compiles and executes its graph on the CPU. `sum` produces a zero-dimensional traced tensor, whose result is read with `only(result)` or `Array(result)[]`.
 
 ```jldoctest
 julia> using Tenferro, DifferentiationInterface
@@ -130,7 +179,7 @@ julia> gradient(x -> sum(x * x), AutoTenferroTraced(), [1.0 2.0; 3.0 4.0]) ≈ [
 true
 ```
 
-`AutoTenferroTraced()` uses tenferro-rs graph transformations, through a separate traced context. It supports scalar gradients, pullbacks and pushforwards for an array or a tuple of arrays, with the same seed and tangent shape/type requirements as the eager backend. Prepared execution and symbolic inputs are not yet exposed. Supported data is CPU arrays of `Float32`, `Float64`, `ComplexF32` or `ComplexF64`; operations include those listed above. Each `Array` conversion compiles and executes the graph anew.
+`AutoTenferroTraced()` uses tenferro-rs graph transformations, through a separate traced context. It supports the same gradients, pullbacks, pushforwards, `value_and_*` variants, `Constant` contexts and parameter structures as the eager backend, with the same seed and tangent shape/type requirements. Prepared execution and symbolic inputs are not yet exposed. Supported data is CPU arrays of `Float32`, `Float64`, `ComplexF32` or `ComplexF64`; operations include those listed above. Each `Array` conversion compiles and executes the graph anew.
 
 ## Complex differentiation convention
 

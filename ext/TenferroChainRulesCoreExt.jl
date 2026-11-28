@@ -1,11 +1,14 @@
 module TenferroChainRulesCoreExt
 
 using ChainRulesCore
-using Tenferro: EagerTensor, EagerContext
+using Tenferro: EagerTensor, EagerContext, EagerScalar, TracedTensor, stopgrad
 using Tenferro: _rust_call, RustCrate
 using RustCall
 
 # ChainRules reverse rules for Tenferro eager operations.
+
+# Tenferro differentiates on its own tape, so block gradients there explicitly.
+ChainRulesCore.ignore_derivatives(x::Union{EagerTensor,EagerScalar,TracedTensor}) = stopgrad(x)
 
 function ChainRulesCore.rrule(::typeof(sum), a::EagerTensor)
     output = sum(a)

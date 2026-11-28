@@ -287,26 +287,6 @@ function _slice(a::TracedTensor{T}, values, dims) where {T}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_slice_node, UInt(a.id), values))
     TracedTensor{T,length(dims),typeof(a.graph)}(a.graph, id, dims)
 end
-function _slice_index(a::_ADTensor, indices::Union{Integer,AbstractRange{<:Integer},Colon}...)
-    length(indices) == length(a.dims) || throw(ArgumentError("one index per dimension is required"))
-    ranges = map(indices, a.dims) do i, n
-        r = i isa Colon ? (1:n) : i isa Integer ? (i:i) : i
-        isempty(r) && throw(ArgumentError("empty slices are not supported"))
-        step(r) > 0 || throw(ArgumentError("slice steps must be positive"))
-        first(r) >= 1 && last(r) <= n || throw(BoundsError(a, indices))
-        r
-    end
-    starts = map(r -> first(r)-1, ranges)
-    limits = map(last, ranges)
-    strides = map(step, ranges)
-    values = UInt[starts..., limits..., strides...]
-    full_dims = map(length, ranges)
-    result = _slice(a, values, full_dims)
-    out_dims = Tuple(full_dims[i] for i in eachindex(indices) if !(indices[i] isa Integer))
-    output = full_dims == out_dims ? result : reshape(result, out_dims)
-    isempty(out_dims) && output isa EagerTensor && return _scalar_result(output)
-    return output
-end
 
 function _matrix_structure(a::EagerTensor{T,2}, op, k, dims) where {T}
     id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.matrix_structure, UInt(a.id), Int32(op), Int64(k)))
@@ -365,7 +345,10 @@ function LinearAlgebra.qr(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T
 end
 
 function _cat(first::_ADTensor, rest, dims)
-    dims isa Integer && 1 <= dims <= length(first.dims) || throw(ArgumentError("cat requires one existing dimension"))
+    dims isa Integer && dims >= 1 || throw(ArgumentError("cat requires one positive dimension"))
+    rank = max(dims, length(first.dims), map(a -> length(a.dims), rest)...)
+    first = _pad_rank(first, rank)
+    rest = map(a -> _pad_rank(a, rank), rest)
     for a in rest
         a.graph === first.graph || throw(ArgumentError("tensors belong to different contexts"))
         length(a.dims) == length(first.dims) || throw(DimensionMismatch("tensor ranks do not match"))
@@ -429,22 +412,6 @@ function LinearAlgebra.eigen(h::TensorHermitian; sortby=LinearAlgebra.eigsortby)
 end
 LinearAlgebra.cholesky(h::TensorHermitian) = TensorCholesky(_linalg_unary(_hermitian_matrix(h), 3, h.data.dims))
 
-Base.getindex(a::_ADTensor, indices::Union{Integer,AbstractRange{<:Integer},Colon}...) = _slice_index(a, indices...)
-Base.getindex(a::EagerTensor{T,1}, indices::AbstractRange{<:Integer}) where {T} = _slice_index(a, indices)
-Base.getindex(a::TracedTensor{T,1}, indices::AbstractRange{<:Integer}) where {T} = _slice_index(a, indices)
-
-function Base.getindex(a::EagerTensor{T,1}, indices::AbstractVector{<:Integer}) where {T}
-    all(i -> 1 <= i <= a.dims[1], indices) || throw(BoundsError(a, indices))
-    ix = EagerTensor(EagerContext(a.graph), reshape(Int64.(indices) .- 1, :, 1))
-    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.gather_vector, UInt(a.id), UInt(ix.id)))
-    EagerTensor{T,1,typeof(a.graph)}(a.graph, id, (length(indices),))
-end
-function Base.getindex(a::TracedTensor{T,1}, indices::AbstractVector{<:Integer}) where {T}
-    all(i -> 1 <= i <= a.dims[1], indices) || throw(BoundsError(a, indices))
-    ix = TracedTensor(TracedContext(a.graph), reshape(Int64.(indices) .- 1, :, 1))
-    id = RustCall.result_to_exception(_rust_call(a.graph, RustCrate.traced_gather_vector, UInt(a.id), UInt(ix.id)))
-    TracedTensor{T,1,typeof(a.graph)}(a.graph, id, (length(indices),))
-end
 
 function LinearAlgebra.lu(a::Union{EagerTensor{T,2},TracedTensor{T,2}}) where {T<:ADElement}
     m, n = a.dims; k = min(m, n)
@@ -561,6 +528,7 @@ function Base.:*(a::TracedTensor{T,2}, x::TracedTensor{S,1}) where {T,S}
     a.dims[2] == x.dims[1] || throw(DimensionMismatch("matrix and vector dimensions do not match"))
     reshape(a * reshape(x, (x.dims[1], 1)), (a.dims[1],))
 end
+Base.:*(a::Union{EagerTensor{T,2},TracedTensor{T,2}}, x::AbstractVector{S}) where {T,S<:TensorElement} = a * _constant_tensor(a, x)
 Base.:*(a::AbstractMatrix{T}, x::EagerTensor{S,1}) where {T<:TensorElement,S} = _constant_tensor(x, a) * x
 Base.:*(a::AbstractMatrix{T}, x::TracedTensor{S,1}) where {T<:TensorElement,S} = _constant_tensor(x, a) * x
 
@@ -577,10 +545,6 @@ for op in (:+, :-)
     end
 end
 
-function Base.getindex(a::EagerTensor{T,1}, mask::AbstractVector{Bool}) where {T}
-    length(mask) == a.dims[1] || throw(BoundsError(a, mask))
-    a[findall(mask)]
-end
 function Base.getindex(a::TracedTensor{T,1}, mask::AbstractVector{Bool}) where {T}
     length(mask) == a.dims[1] || throw(BoundsError(a, mask))
     a[findall(mask)]
@@ -608,8 +572,6 @@ function _sort_eigen(f::TensorEigen, sortby)
     TensorEigen(values, vectors)
 end
 
-Base.getindex(a::EagerTensor{T,1}, i::Integer) where {T} = _scalar_result(reshape(a[[i]], ()))
-Base.getindex(a::TracedTensor{T,1}, i::Integer) where {T} = reshape(a[[i]], ())
 
 # The core Rust `sign` rule treats sign as locally constant. For complex values,
 # sign(z) = z / abs(z) has a nonzero real-linear derivative away from zero.
